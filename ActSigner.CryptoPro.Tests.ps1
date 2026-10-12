@@ -107,8 +107,16 @@ namespace ActSignerTests {
     Must-Fail { Invoke-ActCryptoSign $session $snapshot } 'Closed sessions must not retry signing.'
     Assert-Case ($fake.Calls -eq $calls) 'Closed session sent an extra signing command.'
 
+    foreach($hr in @('0x80090036','0x8010006E','0x800704C7','0x80004005')) {
+        $fake=New-Object ActSignerTests.BridgeFake
+        $fake.Reply=@('ACTSIGNER/1',('0'*32),'ERROR','SIGN','SignedData.SignCades','NATIVE',$hr,'END')
+        $failure=$null
+        try { Invoke-ActBridgeExchange $fake 'SIGN' | Out-Null } catch { $failure=$_.Exception }
+        Assert-Case ($null -ne $failure) 'Native signing error must fail.'
+        $expected=if($hr -eq '0x80004005'){'session'}else{'cancelled'}
+        Assert-Case ($failure.Data['ActSignerFailure'] -ceq $expected) 'Cancellation/session reason must survive the bridge as a typed error.'
+    }
     $savedFactory = (Get-Item Function:New-ActBridgeTransport).ScriptBlock
-    $savedEnvelopeAssert = (Get-Item Function:Assert-ActDetachedCmsEnvelope).ScriptBlock
     try {
         Set-Item Function:script:New-ActBridgeTransport -Value { return $script:ActTestTransport }
         $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
@@ -126,62 +134,15 @@ namespace ActSignerTests {
         $script:ActTestTransport.ThrowOnFinish = $true
         Must-Fail { Test-ActCryptoSignature $snapshot ([byte[]]@(1, 2, 3)) $thumb } 'A failed worker exit must not count as verification.'
 
-        # Clean synthetic RSA CMS envelopes; the generating key was never stored.
-        # These test parser shape only. Native CryptoPro remains signer authority.
-        [byte[]]$cmsDetached = [Convert]::FromBase64String('MIIBjwYJKoZIhvcNAQcCoIIBgDCCAXwCAQExDzANBglghkgBZQMEAgEFADALBgkqhkiG9w0BBwExggFXMIIBUwIBATAsMCcxJTAjBgNVBAMMHEFjdFNpZ25lciBzeW50aGV0aWMgZW52ZWxvcGUCAQEwDQYJYIZIAWUDBAIBBQAwDQYJKoZIhvcNAQEBBQAEggEANzNJ0VK9/VPPl4Mq3fsv6pea34/I80LTlkNDOBjJgDNNn9YqNLY5P92aFtFdDAZai2pyVF8RfCagHYbPdHDczGQgUM14qGzPY2fhtYXXDG9Tq0JoUxspC8csxl9UOGlqSCdTrXSQqNfybexapY74dIHm+/41O+2MlQO3kJvfIKWVt95khSBsh/LvszBnyaQRRHQOlStnvpRV64DfWR0Dsro9WwzKH+aZZSk9X1Er4DrHbH3Royh/IF+QU/3U/HPZpIPEqrkYcrfyGruPDfqpBPYPs7B69l7OolNbmxiFQRFlFA3gLfQyg/tKyraYx8w1Oo/jwFt0MEpeEJasYprIrQ==')
-        [byte[]]$cmsAttached = [Convert]::FromBase64String('MIIBxAYJKoZIhvcNAQcCoIIBtTCCAbECAQExDzANBglghkgBZQMEAgEFADBABgkqhkiG9w0BBwGgMwQxJVBERi0xLjcKQUNUU0lHTkVSIFNZTlRIRVRJQyBFTlZFTE9QRSBURVNUCiUlRU9GCjGCAVcwggFTAgEBMCwwJzElMCMGA1UEAwwcQWN0U2lnbmVyIHN5bnRoZXRpYyBlbnZlbG9wZQIBATANBglghkgBZQMEAgEFADANBgkqhkiG9w0BAQEFAASCAQA3M0nRUr39U8+Xgyrd+y/ql5rfj8jzQtOWQ0M4GMmAM02f1io0tjk/3ZoW0V0MBlqLanJUXxF8JqAdhs90cNzMZCBQzXiobM9jZ+G1hdcMb1OrQmhTGykLxyzGX1Q4aWpIJ1OtdJCo1/Jt7Fqljvh0geb7/jU77YyVA7eQm98gpZW33mSFIGyH8u+zMGfJpBFEdA6VK2e+lFXrgN9ZHQOyuj1bDMof5pllKT1fUSvgOsdsfdGjKH8gX5BT/dT8c9mkg8SquRhyt/Iau48N+qkE9g+zsHr2Xs6iU1ubGIVBEWUUDeAt9DKD+0rKtpjHzDU6j+PAW3QwSl4Qlqximsit')
-        [byte[]]$cmsOtherAttached = [Convert]::FromBase64String('MIIBrQYJKoZIhvcNAQcCoIIBnjCCAZoCAQExDzANBglghkgBZQMEAgEFADApBgkqhkiG9w0BBwGgHAQaQU5PVEhFUiBTWU5USEVUSUMgRE9DVU1FTlQxggFXMIIBUwIBATAsMCcxJTAjBgNVBAMMHEFjdFNpZ25lciBzeW50aGV0aWMgZW52ZWxvcGUCAQEwDQYJYIZIAWUDBAIBBQAwDQYJKoZIhvcNAQEBBQAEggEASuDUhiCiVNZTO3mkzZzgOSRsJf05JPl/v67JAKNw/I97IxclYPZMUYeeFYggms/XbMGGn2HFzN5BM4MTNfcQMFIFndHKltyA0Cky4QksdWPIz1GPfJHD8yqQM4ANKDQZv3QPhp97Tk7/uSESIbCHlG++hsOXCFPl9L92Tq+KctMmsPS3HdasT+w6U44VqX7Zu6HTaLhyrtoMH98Ib9vpSUUPotruNP5bRnT7NiJxqtgwW/q7DlbGO1sHwbyPBjruSvHn4pApHU/oMFkYho+X/OvAqaIfg1ki0mr6wkDfl23j9DvPylriUWQS4kkhyACZ9K5dqj+mNPCAuZENLeZxWQ==')
-        [byte[]]$fixturePdf = [Text.Encoding]::ASCII.GetBytes("%PDF-1.7`nACTSIGNER SYNTHETIC ENVELOPE TEST`n%%EOF`n")
-        Assert-ActDetachedCmsEnvelope $cmsDetached
-        foreach ($encoded in @($cmsAttached, $cmsOtherAttached, [byte[]]@(0x30, 3, 2, 1, 0))) {
-            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-            $info = Get-ActExistingSignatureInfo $fixturePdf $encoded
-            Assert-Case ($info.Status -ceq 'unverifiable' -and $info.Thumbprints.Count -eq 0 -and $script:ActTestTransport.Calls -eq 0) 'Attached CMS for either the same or another PDF, and malformed CMS, must be unresolved before native inspection.'
-        }
-        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-        $script:ActTestTransport.Reply = Make-Frame 'INSPECT' @('valid', '1', ('B' * 40))
-        $info = Get-ActExistingSignatureInfo $fixturePdf $cmsDetached
-        Assert-Case ($info.Status -ceq 'valid' -and $info.Thumbprints[0] -ceq ('B' * 40) -and $script:ActTestTransport.Calls -eq 1) 'Signer identities must come from native verification, never from the untrusted envelope parser.'
-
-        # Following cases isolate framing/normalization/transport from the decoder.
-        Set-Item Function:script:Assert-ActDetachedCmsEnvelope -Value { param([byte[]]$SignatureBytes) }
-        [byte[]]$der = @(0x30, 3, 2, 1, 0)
+        # Normalization has no worker or key access. CMS identity/math is tested natively.
+        [byte[]]$der = @(0x30,3,2,1,0)
         $derBase64 = [Convert]::ToBase64String($der)
-        foreach ($encoded in @($der, [Text.Encoding]::ASCII.GetBytes($derBase64), [Text.Encoding]::ASCII.GetBytes(("-----BEGIN PKCS7-----`r`n{0}`r`n-----END PKCS7-----`r`n" -f $derBase64)), [Text.Encoding]::UTF8.GetBytes(("{0}-----BEGIN CMS-----`r`n{1}`r`n-----END CMS-----" -f [char]0xfeff, $derBase64)))) {
-            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-            $script:ActTestTransport.Reply = Make-Frame 'INSPECT' @('valid', '2', ('B' * 40), $thumb)
-            $info = Get-ActExistingSignatureInfo -PdfBytes $snapshot -SignatureBytes $encoded
-            Assert-Case ($info.Status -ceq 'valid' -and $info.Thumbprints.Count -eq 2 -and $info.Thumbprints[1] -ceq $thumb) 'Existing CMS must return all verified signers, including the selected signer in a later slot.'
-            Assert-Case ([Object]::ReferenceEquals($script:ActTestTransport.Pdf, $snapshot)) 'Existing-signature inspection changed or reread the supplied PDF snapshot.'
-            Assert-Case ([Convert]::ToBase64String($script:ActTestTransport.Signature) -ceq $derBase64) 'DER/Base64/PEM signature normalization changed bytes.'
-            Assert-Case ($script:ActTestTransport.Command -ceq 'INSPECT' -and $script:ActTestTransport.Kind -eq 0 -and $script:ActTestTransport.Thumb -ceq '') 'Inspection must not select a store or a signing certificate.'
-            Assert-Case ($script:ActTestTransport.Calls -eq 1 -and $script:ActTestTransport.Timeout -eq 60000 -and $script:ActTestTransport.Maximum -le 192KB) 'Inspection must use one bounded 60 second exchange without retries.'
-            Assert-Case ($script:ActTestTransport.Finished -and $script:ActTestTransport.IsClosed) 'Inspection must cleanly finish and dispose its independent worker.'
+        foreach($encoded in @($der,[Text.Encoding]::ASCII.GetBytes($derBase64),[Text.Encoding]::ASCII.GetBytes(("-----BEGIN CMS-----`r`n{0}`r`n-----END CMS-----" -f $derBase64)))) {
+            Assert-Case ([Convert]::ToBase64String((ConvertTo-ActExistingSignatureDer $encoded)) -ceq $derBase64) 'DER/Base64/PEM normalization changed bytes.'
         }
-        foreach ($state in @('different_content', 'unverifiable')) {
-            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-            $script:ActTestTransport.Reply = Make-Frame 'INSPECT' @($state, '0', 'SignedData.VerifyCades', 'NATIVE', '0x80091007')
-            $info = Get-ActExistingSignatureInfo $snapshot $der
-            Assert-Case ($info.Status -ceq $state -and $info.Thumbprints.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($info.Message)) 'An unsuccessful inspection must retain its precise state and no signer identity.'
+        foreach($encoded in @([byte[]]@(),[byte[]]@(0,255,0),[Text.Encoding]::ASCII.GetBytes('MAMEAQA= trailing'),[Text.Encoding]::ASCII.GetBytes('-----BEGIN CMS-----MAMCAQA=-----END PKCS7-----'))) {
+            Must-Fail { ConvertTo-ActExistingSignatureDer $encoded } 'Malformed encoding must be rejected.'
         }
-        foreach ($bad in @(@('valid', '0'), @('valid', '1', 'not-a-thumbprint'), @('valid', '4097'), @('valid', '1', $thumb, 'EXTRA'), @('unverifiable', '1', $thumb, 'SignedData.VerifyCades', 'NATIVE', '0x80091007'), @('unknown', '0'), @('different_content', '0', 'UNSAFE_PROVIDER_DETAIL / private', 'NATIVE', '0x80091007'), @('different_content', '0', 'SignedData.VerifyCades', 'NATIVE', '0x800B0109'))) {
-            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-            $script:ActTestTransport.Reply = Make-Frame 'INSPECT' $bad
-            Must-Fail { Get-ActExistingSignatureInfo $snapshot $der } 'Malformed inspection data must fail instead of returning an absent signature.'
-        }
-        foreach ($encoded in @([byte[]]@(), [byte[]]@(0, 255, 0), [Text.Encoding]::ASCII.GetBytes('MAMEAQA= trailing'), [Text.Encoding]::ASCII.GetBytes('-----BEGIN CMS-----MAMCAQA=-----END PKCS7-----'))) {
-            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-            $info = Get-ActExistingSignatureInfo $snapshot $encoded
-            Assert-Case ($info.Status -ceq 'unverifiable' -and $info.Thumbprints.Count -eq 0 -and $script:ActTestTransport.Calls -eq 0) 'Malformed encoding must remain unresolved without contacting the worker.'
-        }
-        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-        $script:ActTestTransport.ThrowOnExchange = $true
-        Must-Fail { Get-ActExistingSignatureInfo $snapshot $der } 'A worker transport failure must not become a missing neighboring signature.'
-        Assert-Case ($script:ActTestTransport.Calls -eq 1 -and $script:ActTestTransport.IsClosed) 'Failed inspection must dispose the worker without retrying.'
-        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
-        $script:ActTestTransport.Reply = Make-Frame 'INSPECT' @('valid', '1', $thumb)
-        $script:ActTestTransport.ThrowOnFinish = $true
-        Must-Fail { Get-ActExistingSignatureInfo $snapshot $der } 'A failed worker exit must invalidate existing-signature inspection.'
 
         $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
         $script:ActTestTransport.Reply = Make-Frame 'DISCOVER' @('0', '0', 'EXTRA')
@@ -194,10 +155,9 @@ namespace ActSignerTests {
         Assert-Case (-not $status.Available -and $status.Message.Contains('CScript') -and -not $status.Message.Contains('UNSAFE_PROVIDER_DETAIL')) 'Host denial/error must be understandable without raw provider text.'
     } finally {
         Set-Item Function:script:New-ActBridgeTransport -Value $savedFactory
-        Set-Item Function:script:Assert-ActDetachedCmsEnvelope -Value $savedEnvelopeAssert
         Remove-Variable ActTestTransport -Scope Script -ErrorAction SilentlyContinue
     }
-    Write-Host 'PASS: PowerShell protocol, exact snapshots, CMS envelope/encoding guards, signer matching, host errors and closed-session checks.'
+    Write-Host 'PASS: PowerShell protocol, exact snapshots, encoding guards, signer matching, host errors and closed-session checks.'
 }
 
 $node = Get-Command node -ErrorAction SilentlyContinue

@@ -108,6 +108,7 @@ function Get-ActNeighborSignatureCheck {
     $records = New-Object 'System.Collections.Generic.List[object]'
     $issues = New-Object 'System.Collections.Generic.List[string]'
     $duplicatePath = ''
+    $foreignCount = 0
     $candidateIndex = 0
     foreach ($path in $paths) {
         $candidateIndex++
@@ -125,7 +126,29 @@ function Get-ActNeighborSignatureCheck {
             $answers = @(& $Inspector ([byte[]]$SourceState.Bytes) ([byte[]]$signatureState.Bytes))
             if ($answers.Count -ne 1 -or $null -eq $answers[0] -or $null -eq $answers[0].PSObject.Properties['Status']) { throw 'Средство проверки вернуло некорректный результат.' }
             $answer = $answers[0]
-            if ([string]$answer.Status -cnotin @('valid', 'different_content', 'unverifiable')) { throw 'Средство проверки вернуло неизвестный статус.' }
+            if ([string]$answer.Status -cnotin @('identified', 'valid', 'different_content', 'unverifiable')) { throw 'Средство проверки вернуло неизвестный статус.' }
+            if ($answer.Status -ceq 'identified') {
+                if ($null -eq $answer.PSObject.Properties['Signers'] -or @($answer.Signers).Count -lt 1 -or @($answer.Signers).Count -gt 4096) { throw 'Не установлен полный состав подписантов CMS.' }
+                $confirmedOwn = $false
+                $unresolved = $false
+                $details = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($signer in @($answer.Signers)) {
+                    if ($null -eq $signer -or $null -eq $signer.PSObject.Properties['Thumbprint'] -or $null -eq $signer.PSObject.Properties['SignatureStatus']) { throw 'Неполные сведения о подписанте CMS.' }
+                    $actual = [regex]::Replace([string]$signer.Thumbprint, '\s', '').ToUpperInvariant()
+                    if ($actual -cnotmatch '^[0-9A-F]{40}$' -or [string]$signer.SignatureStatus -cnotin @('valid', 'unverifiable')) { throw 'Некорректные сведения о подписанте CMS.' }
+                    if ($signer.SignatureStatus -ceq 'valid' -and $actual -ceq $Thumbprint) { $confirmedOwn = $true }
+                    if ($signer.SignatureStatus -cne 'valid') {
+                        $unresolved = $true
+                        $hr = ''
+                        if ($null -ne $signer.PSObject.Properties['HResult'] -and [string]$signer.HResult -cmatch '^0x[0-9A-F]{8}$') { $hr = ' HRESULT ' + $signer.HResult + '.' }
+                        $details.Add(('Подписант {0}: математическая проверка над точными байтами PDF не подтверждена.{1}' -f $actual, $hr))
+                    }
+                }
+                if ($confirmedOwn) { $duplicatePath = $path; break }
+                if ($unresolved) { throw ($details.ToArray() -join ' ') }
+                $foreignCount++
+                Send-ActProgress $OnProgress $Index $Total $Item 'foreign_signature' ('Чужая подпись: {0}. Математическая проверка успешна; доверие, сроки цепочки и отзыв не проверялись.' -f [IO.Path]::GetFileName($path))
+            }
             if ($answer.Status -ceq 'unverifiable') {
                 $message = 'Не удалось достоверно проверить подпись.'
                 if ($null -ne $answer.PSObject.Properties['Message'] -and -not [string]::IsNullOrWhiteSpace([string]$answer.Message)) { $message = [string]$answer.Message }
@@ -140,9 +163,17 @@ function Get-ActNeighborSignatureCheck {
                     if ($normalized -ceq $Thumbprint) { $matchesSelected = $true }
                 }
                 if ($matchesSelected) { $duplicatePath = $path; break }
+                $foreignCount++
             }
         }
-        catch { $issues.Add(([IO.Path]::GetFileName($path) + ': ' + $_.Exception.Message)) }
+        catch {
+            $failure = $_.Exception
+            while ($null -ne $failure) {
+                if ($failure.Data['ActSignerFailure'] -in @('session', 'cancelled')) { throw }
+                $failure = $failure.InnerException
+            }
+            $issues.Add(([IO.Path]::GetFileName($path) + ': ' + $_.Exception.Message))
+        }
         finally { if ($null -ne $signatureState -and $null -ne $signatureState.Stream) { $signatureState.Stream.Dispose() } }
     }
     # A confirmed selected-certificate duplicate ends further inspections, even
@@ -150,7 +181,7 @@ function Get-ActNeighborSignatureCheck {
     if ([string]::IsNullOrEmpty($duplicatePath) -and $issues.Count -gt 0) {
         throw ('Нельзя безопасно создать новую подпись: ' + ($issues.ToArray() -join ' | '))
     }
-    return [pscustomobject]@{ Paths = $paths; Records = $records; DuplicatePath = $duplicatePath }
+    return [pscustomobject]@{ Paths = $paths; Records = $records; DuplicatePath = $duplicatePath; ForeignCount = $foreignCount }
 }
 
 function Assert-ActNeighborSignaturesUnchanged {
@@ -176,8 +207,11 @@ function Get-ActPlan {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$OutputRoot
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [ValidateSet('legacy','signer','document_signer')][string]$SignatureNaming = 'legacy',
+        [string]$SignerLabel = ''
     )
+    if($SignatureNaming -ne 'legacy' -and $SignerLabel -cnotmatch '^[a-z0-9][a-z0-9_-]{0,79}$') { throw 'Не удалось получить безопасное имя подписанта из сертификата. Выберите прежний формат .my.sig.' }
     $sourceRoot = Get-ActFullPath $Root
     $destinationRoot = Get-ActFullPath $OutputRoot
     if (-not [System.IO.Directory]::Exists($sourceRoot)) { throw ('Исходная папка не найдена: ' + $sourceRoot) }
@@ -209,7 +243,12 @@ function Get-ActPlan {
             if (-not [regex]::IsMatch($entry.Name, $script:ActNamePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) { continue }
             $relative = $entry.FullName.Substring($sourcePrefix.Length)
             $documentOutput = [System.IO.Path]::Combine($destinationRoot, $relative)
-            $signatureName = [System.IO.Path]::GetFileNameWithoutExtension($entry.Name) + '.my.sig'
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($entry.Name)
+            $signatureName = switch($SignatureNaming) {
+                'signer' { 'signature_' + $SignerLabel + '.sig' }
+                'document_signer' { $baseName + '_' + $SignerLabel + '.sig' }
+                default { $baseName + '.my.sig' }
+            }
             $signaturePath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($documentOutput), $signatureName)
             $items.Add([pscustomobject]@{
                 SourcePath = $entry.FullName
@@ -411,6 +450,8 @@ function Invoke-ActBatch {
     )
     $ErrorActionPreference = 'Stop'
     $items = @($Plan.Items)
+    $conflictingTargets=@{}
+    foreach($group in @($items | Group-Object -Property SignaturePath | Where-Object {$_.Count -gt 1})) { $conflictingTargets[[string]$group.Name]=$true }
     $copy = [bool]$Plan.SeparateOutput
     if ($PSBoundParameters.ContainsKey('CopyOriginals')) { $copy = [bool]$CopyOriginals }
     $thumb = [regex]::Replace($Thumbprint, '\s', '').ToUpperInvariant()
@@ -422,6 +463,7 @@ function Invoke-ActBatch {
     $writer = $null
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $stopped = $false
+    $stopReason = ''
     try {
         $logStream = [System.IO.File]::Open($logPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
         $writer = New-Object System.IO.StreamWriter($logStream, (New-Object System.Text.UTF8Encoding($true)))
@@ -431,13 +473,14 @@ function Invoke-ActBatch {
         for ($index = 0; $index -lt $items.Count; $index++) {
             $item = $items[$index]
             if ($stopped) {
-                $row = New-ActResultRow $item '' $thumb 'not_processed' 'Не обработан: выполнение остановлено после предыдущей ошибки.'
+                $reason = if ($stopReason -eq 'cancelled') { 'пользователь отменил криптографическую операцию' } else { 'криптографический сеанс остановлен после ошибки' }
+                $row = New-ActResultRow $item '' $thumb 'not_processed' ('Не обработан: ' + $reason + '.')
                 $rows.Add($row)
                 Write-ActCsvRow $writer $row
                 Send-ActProgress $OnProgress ($index + 1) $items.Count $item $row.Status $row.Message
                 continue
             }
-            if ([System.IO.File]::Exists($item.SignaturePath)) {
+            if ([System.IO.File]::Exists($item.SignaturePath) -and $null -eq $ExistingSignatureInspector) {
                 $row = New-ActResultRow $item '' $thumb 'exists_unverified' 'Подпись с таким именем уже существует. Пропущена без проверки.'
                 $rows.Add($row)
                 Write-ActCsvRow $writer $row
@@ -450,6 +493,7 @@ function Invoke-ActBatch {
             $hash = ''
             $stage = 'Подготовка'
             try {
+                if($conflictingTargets.ContainsKey([string]$item.SignaturePath)) { throw 'Несколько выбранных актов имеют одинаковое имя подписи. Выберите формат с именем акта или разложите акты по отдельным папкам.' }
                 $sourceState = Open-ActReadState -Path $item.SourcePath -RequirePdf
                 $states.Add($sourceState)
                 $hash = $sourceState.Hash
@@ -460,6 +504,9 @@ function Invoke-ActBatch {
                     Assert-ActNeighborSignaturesUnchanged $item $neighborCheck -DuplicateOnly
                     if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время проверки существующих подписей.' }
                     $row = New-ActResultRow $item $hash $thumb 'already_signed' ('Акт уже подписан выбранным сертификатом. Проверенная соседняя подпись: ' + $neighborCheck.DuplicatePath + '. Новая подпись и копии не создавались.')
+                }
+                elseif ([System.IO.File]::Exists($item.SignaturePath)) {
+                    $row = New-ActResultRow $item $hash $thumb 'exists_unverified' 'Имя выходной подписи занято. Подпись выбранным сертификатом над этим PDF не подтверждена. Файл сохранён без перезаписи.'
                 }
                 else {
                     $stage = 'Подготовка'
@@ -509,12 +556,24 @@ function Invoke-ActBatch {
                     Assert-ActNeighborSignaturesUnchanged $item $neighborCheck
                     $stage = 'Сохранение подписи'
                     Write-NewActFile -Path $item.SignaturePath -Bytes $signatureBytes
-                    $row = New-ActResultRow $item $hash $thumb 'signed_verified' 'Новая подпись создана и проверена; исходный акт не изменён.'
+                    $message = 'Новая подпись создана и проверена; исходный акт не изменён.'
+                    if ($neighborCheck.ForeignCount -gt 0) { $message += (' Соседние подписи других сертификатов: {0}. Их математическая проверка успешна; доверие, сроки цепочки и отзыв не проверялись.' -f $neighborCheck.ForeignCount) }
+                    $row = New-ActResultRow $item $hash $thumb 'signed_verified' $message
                 }
             }
             catch {
-                $stopped = $true
-                $row = New-ActResultRow $item $hash $thumb 'error' ($stage + ': ' + $_.Exception.Message)
+                $kind = ''
+                $failure = $_.Exception
+                while ($null -ne $failure) {
+                    if ($failure.Data['ActSignerFailure'] -in @('session', 'cancelled')) { $kind = [string]$failure.Data['ActSignerFailure']; break }
+                    if ($failure -is [OperationCanceledException]) { $kind = 'cancelled'; break }
+                    $failure = $failure.InnerException
+                }
+                if ($kind -eq '' -and $stage -in @('Подписание', 'Проверка подписи')) { $kind = 'session' }
+                $stopped = $kind -in @('session', 'cancelled')
+                if ($stopped) { $stopReason = $kind }
+                $status = if ($kind -eq 'cancelled') { 'cancelled' } else { 'error' }
+                $row = New-ActResultRow $item $hash $thumb $status ($stage + ': ' + $_.Exception.Message)
             }
             finally {
                 foreach ($state in $states) { if ($null -ne $state.Stream) { $state.Stream.Dispose() } }
@@ -533,6 +592,8 @@ function Invoke-ActBatch {
         Rows = $allRows
         LogPath = $logPath
         Stopped = $stopped
+        StopReason = $stopReason
+        CancelledCount = @($allRows | Where-Object { $_.Status -eq 'cancelled' }).Count
         CompletedCount = @($allRows | Where-Object { $_.Status -eq 'signed_verified' }).Count
         SkippedCount = @($allRows | Where-Object { $_.Status -in @('exists_unverified', 'already_signed') }).Count
         AlreadySignedCount = @($allRows | Where-Object { $_.Status -eq 'already_signed' }).Count

@@ -17,12 +17,12 @@ $module = Import-Module $ModulePath -Force -PassThru
     function script:Get-ActSignerSettings {
         [pscustomobject]@{ SourceRoot = 'C:\SyntheticActs'; SeparateOutputRoot = 'C:\SyntheticOutput'; SaveBesideSources = $false }
     }
-    function script:Save-ActSignerSettings { param($SourceRoot, $SeparateOutputRoot, $SaveBesideSources) return $true }
+    function script:Save-ActSignerSettings { param($SourceRoot, $SeparateOutputRoot, $SaveBesideSources, $SignatureNaming) return $true }
 }
 
 $certificate = [pscustomobject]@{
     DisplayName = 'SYNTHETIC UI TEST'; Subject = 'CN=SYNTHETIC UI TEST'; Issuer = 'CN=SYNTHETIC TEST ISSUER'
-    Thumbprint = '0000000000000000000000000000000000000000'; Source = 'Synthetic provider'; StoreKind = 'Synthetic'
+    FileLabel = 'ivanov'; Thumbprint = '0000000000000000000000000000000000000000'; Source = 'Synthetic provider'; StoreKind = 'Synthetic'
     NotBefore = [datetime]'2026-01-01'; NotAfter = [datetime]'2030-01-01'
 }
 $items = @(for ($i = 0; $i -lt 20; $i++) {
@@ -43,7 +43,8 @@ $syntheticReadError = 'SYNTHETIC CERTIFICATE READ FAILURE'
 $certificateProvider = { [pscustomobject]@{ Certificates = @($certificate); Warnings = @($syntheticWarning) } }.GetNewClosure()
 $providerCalls = @{ Count = 0; SourceRoot = ''; DestinationRoot = '' }
 $planProvider = {
-    param($SourceRoot, $DestinationRoot)
+    param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel)
+    $providerCalls.SignatureNaming=$SignatureNaming; $providerCalls.SignerLabel=$SignerLabel
     $providerCalls.Count++
     $providerCalls.SourceRoot = [string]$SourceRoot
     $providerCalls.DestinationRoot = [string]$DestinationRoot
@@ -197,7 +198,13 @@ $timer.Add_Tick({
             $form.WindowState = 'Normal'
             $form.Size = New-Object Drawing.Size(1000, 700)
             $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
+            $naming=@($controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format' })
+            & $assert ($naming.Count -eq 1) 'A persistent filename format choice must be available.'
+            if($naming.Count -ne 1){throw 'Missing signature naming control'}
+            & $assert ($naming[0].SelectedIndex -eq 0 -and $naming[0].Items.Count -eq 3) 'Default naming must use the signer surname with both alternatives available.'
+            $naming[0].SelectedIndex=1
             $find.PerformClick()
+            & $assert ($providerCalls.SignatureNaming -ceq 'document_signer' -and $providerCalls.SignerLabel -ceq 'ivanov') 'The plan must use the selected format and selected certificate surname.'
             & $assert ($state.Grid.Rows.Count -eq 20) 'The injected plan must populate all 20 acts.'
             & $assert ([string]$state.Grid.Rows[0].Cells[2].Value -eq 'Проверить подписи (2)') 'Neighboring signatures must be visible as pending inspection.'
             & $assert ([bool]$state.Grid.Rows[0].Cells[0].Value -and -not $state.Grid.Rows[0].Cells[0].ReadOnly) 'Unverified neighboring files must not be treated as already-signed acts in the preview.'
@@ -248,7 +255,7 @@ $timer.Add_Tick({
             for ($i = 0; $i -lt $items.Count; $i++) {
                 & $assert ([object]::ReferenceEquals($grid.Rows[$i].Tag, $items[$i])) ('Row Tag no longer maps to fixture item ' + $i)
                 & $assert ([string]$grid.Rows[$i].Cells[1].Value -eq [string]$items[$i].RelativePath) ('Displayed path differs from row Tag at ' + $i)
-                if ($i -ge 16) { & $assert $grid.Rows[$i].Cells[0].ReadOnly 'Existing signature checkbox must be read-only.' }
+                if ($i -ge 16) { & $assert (-not $grid.Rows[$i].Cells[0].ReadOnly) 'Existing signature must remain selectable for key-free verification.' }
             }
             $clear = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Снять выбор' })[0]
             $select = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать все доступные' })[0]
@@ -256,10 +263,10 @@ $timer.Add_Tick({
             & $assert (-not $state.Form.AcceptButton.Enabled) 'Zero checked acts must disable the plan action.'
             & $assert (@($grid.Rows | Where-Object { [bool]$_.Cells[0].Value }).Count -eq 0) 'Clear must uncheck all rows.'
             $select.PerformClick()
-            & $assert (@($grid.Rows | Where-Object { [bool]$_.Cells[0].Value }).Count -eq 16) 'Select new must check only the new acts.'
+            & $assert (@($grid.Rows | Where-Object { [bool]$_.Cells[0].Value }).Count -eq 20) 'Select all must include existing signatures for verification.'
             $clear.PerformClick()
             $grid.Rows[2].Cells[0].Value = $true
-            $grid.Rows[7].Cells[0].Value = $true
+            $grid.Rows[19].Cells[0].Value = $true
             & $assert ($state.Form.AcceptButton.Text -eq 'Проверить и подписать (2)') 'Plan action must show the checkbox count.'
             # Show-ActSignerWindow only returns a plan. No signing/COM/PIN code is imported.
             $state.Phase = 3
@@ -294,9 +301,9 @@ $priorGlobalSaveBlock = $null
 if ($null -ne $priorGlobalSave) { $priorGlobalSaveBlock = $priorGlobalSave.ScriptBlock }
 $preferenceCalls = New-Object 'System.Collections.Generic.List[object]'
 $saveStub = {
-    param([string]$SourceRoot, [string]$SeparateOutputRoot, [bool]$SaveBesideSources)
+    param([string]$SourceRoot, [string]$SeparateOutputRoot, [bool]$SaveBesideSources, [string]$SignatureNaming)
     $preferenceCalls.Add([pscustomobject]@{
-        SourceRoot = $SourceRoot; SeparateOutputRoot = $SeparateOutputRoot; SaveBesideSources = $SaveBesideSources
+        SourceRoot = $SourceRoot; SeparateOutputRoot = $SeparateOutputRoot; SaveBesideSources = $SaveBesideSources; SignatureNaming = $SignatureNaming
     })
     return $true
 }.GetNewClosure()
@@ -306,11 +313,12 @@ try {
     $result = Show-ActSignerWindow -CertificateProvider $certificateProvider -PlanProvider $planProvider
     if ($null -ne $state.Error) { throw $state.Error }
     & $assert ($state.Phase -eq 3) 'All native UI phases must complete.'
+    & $assert (@($preferenceCalls | Where-Object {$_.SignatureNaming -ceq 'document_signer'}).Count -gt 0) 'The selected filename format must be saved.'
     & $assert ($null -ne $result) 'The UI must return the selected plan.'
     if ($null -ne $result) {
         & $assert ($result.Plan.Items.Count -eq 2) 'Returned plan must contain exactly two checked acts.'
         & $assert ([object]::ReferenceEquals($result.Plan.Items[0], $items[2])) 'Returned first act must map to the row Tag.'
-        & $assert ([object]::ReferenceEquals($result.Plan.Items[1], $items[7])) 'Returned second act must map to the row Tag.'
+        & $assert ([object]::ReferenceEquals($result.Plan.Items[1], $items[19])) 'Returned second act must map to the row Tag.'
         & $assert ([object]::ReferenceEquals($result.CertificateInfo, $certificate)) 'Returned certificate must be the synthetic selection.'
         & $assert ([bool]$result.CopyOriginals) 'Separate-output choice must remain in the returned plan.'
         & $assert ($result.Plan.OutputRoot -eq 'C:\SyntheticPreviousOutput') 'The returned plan must retain the restored separate-output path.'

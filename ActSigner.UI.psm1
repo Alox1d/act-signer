@@ -66,8 +66,8 @@ function Show-ActSignerWindow {
     }
     if ($null -eq $PlanProvider) {
         $PlanProvider = {
-            param($SourceRoot, $DestinationRoot)
-            Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot
+            param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel)
+            Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel
         }
     }
 
@@ -77,6 +77,9 @@ function Show-ActSignerWindow {
     }
     $defaultOutput = [IO.Path]::Combine($documentsRoot, 'Подписанные_акты')
     $settings = Get-ActSignerSettings
+    $namingModes=@('signer','document_signer','legacy')
+    $initialNaming='signer'
+    if($null -ne $settings.PSObject.Properties['SignatureNaming'] -and $settings.SignatureNaming -cin $namingModes) { $initialNaming=$settings.SignatureNaming }
     if (-not [string]::IsNullOrWhiteSpace($settings.SeparateOutputRoot)) {
         $defaultOutput = $settings.SeparateOutputRoot
     }
@@ -96,6 +99,7 @@ function Show-ActSignerWindow {
         LastSavedSource = $settings.SourceRoot
         LastSavedSeparateOutput = $settings.SeparateOutputRoot
         LastSavedBeside = [bool]$settings.SaveBesideSources
+        LastSavedNaming = $initialNaming
         SettingsWarningShown = $false
         Started = $false
     }
@@ -315,6 +319,22 @@ function Show-ActSignerWindow {
     [void]$toolbar.Controls.Add($find)
     [void]$toolbar.Controls.Add($selectNew)
     [void]$toolbar.Controls.Add($clearSelection)
+    $namingLabel=New-Object System.Windows.Forms.Label
+    $namingLabel.Text='Имя подписи:'
+    $namingLabel.AutoSize=$true
+    $namingLabel.Margin=New-Object System.Windows.Forms.Padding(12,6,4,6)
+    $naming=New-Object System.Windows.Forms.ComboBox
+    $ui.Naming=$naming
+    $naming.DropDownStyle='DropDownList'
+    $naming.Width=235
+    $naming.AccessibleName='Signature filename format'
+    $naming.Margin=New-Object System.Windows.Forms.Padding(0,0,0,6)
+    [void]$naming.Items.Add('signature_<фамилия>.sig')
+    [void]$naming.Items.Add('<имя акта>_<фамилия>.sig')
+    [void]$naming.Items.Add('<имя акта>.my.sig (прежний)')
+    $naming.SelectedIndex=[array]::IndexOf($namingModes,$initialNaming)
+    [void]$toolbar.Controls.Add($namingLabel)
+    [void]$toolbar.Controls.Add($naming)
     [void]$actLayout.Controls.Add($toolbar, 0, 0)
 
     $grid = New-Object System.Windows.Forms.DataGridView
@@ -413,8 +433,8 @@ function Show-ActSignerWindow {
     $form.CancelButton = $cancel
 
     $toolTip.SetToolTip($sourceBox, 'Можно выбрать папку или вставить путь, включая общую папку VM. Поиск включает подпапки.')
-    $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут PDF и новые .my.sig.')
-    $toolTip.SetToolTip($beside, 'Каждая новая .my.sig сохраняется в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.')
+    $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут PDF и новые подписи.')
+    $toolTip.SetToolTip($beside, 'Каждая новая подпись сохраняется в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.')
     $toolTip.SetToolTip($find, 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.')
     $toolTip.SetToolTip($details, 'Полные данные выбранного сертификата и сообщения диагностики.')
     $sign.AccessibleDescription = 'Сначала проверим соседние подписи. Уже подписанные выбранным сертификатом акты будут пропущены. Для остальных создадим новую подпись. Обработка продолжится в консоли; КриптоПро может запросить PIN носителя.'
@@ -442,18 +462,20 @@ function Show-ActSignerWindow {
         $source = $ui.Source.Text.Trim()
         $separateOutput = $state.SeparateOutputText.Trim()
         $saveBeside = [bool]$ui.Beside.Checked
+        $signatureNaming=$namingModes[$ui.Naming.SelectedIndex]
         if ([string]::Equals($source, $state.LastSavedSource, [StringComparison]::Ordinal) -and
             [string]::Equals($separateOutput, $state.LastSavedSeparateOutput, [StringComparison]::Ordinal) -and
-            $saveBeside -eq $state.LastSavedBeside) { return }
+            $saveBeside -eq $state.LastSavedBeside -and $signatureNaming -ceq $state.LastSavedNaming) { return }
         $saved = $false
         try {
-            $saved = Save-ActSignerSettings -SourceRoot $source -SeparateOutputRoot $separateOutput -SaveBesideSources $saveBeside
+            $saved = Save-ActSignerSettings -SourceRoot $source -SeparateOutputRoot $separateOutput -SaveBesideSources $saveBeside -SignatureNaming $signatureNaming
         }
         catch { }
         if ($saved) {
             $state.LastSavedSource = $source
             $state.LastSavedSeparateOutput = $separateOutput
             $state.LastSavedBeside = $saveBeside
+            $state.LastSavedNaming = $signatureNaming
         }
         elseif (-not $state.SettingsWarningShown) {
             $state.SettingsWarningShown = $true
@@ -471,8 +493,8 @@ function Show-ActSignerWindow {
             if ([bool]$row.Tag.ExistingSignature) { $existingCount++ }
             else {
                 $newCount++
-                if ([bool]$row.Cells[0].Value) { $selectedCount++ }
             }
+            if ([bool]$row.Cells[0].Value) { $selectedCount++ }
         }
         $certificateIndex = $ui.Certificate.SelectedIndex
         $hasCertificate = $certificateIndex -ge 0 -and $certificateIndex -lt $state.Certificates.Count
@@ -481,7 +503,7 @@ function Show-ActSignerWindow {
         $ui.Find.Enabled = (-not $state.Busy) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Source.Text)) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Output.Text))
-        $ui.SelectNew.Enabled = (-not $state.Busy) -and $newCount -gt 0
+        $ui.SelectNew.Enabled = (-not $state.Busy) -and ($newCount + $existingCount) -gt 0
         $ui.ClearSelection.Enabled = (-not $state.Busy) -and $selectedCount -gt 0
         $ui.Refresh.Enabled = -not $state.Busy
         $ui.Details.Enabled = -not $state.Busy
@@ -492,8 +514,9 @@ function Show-ActSignerWindow {
         $ui.Output.Enabled = (-not $state.Busy) -and (-not $ui.Beside.Checked)
         $ui.OutputBrowse.Enabled = $ui.Output.Enabled
         $ui.Grid.Enabled = -not $state.Busy
+        $ui.Naming.Enabled = -not $state.Busy
         if ($null -ne $state.Plan) {
-            $text = 'Найдено: {0}   |   Выбрано: {1}   |   Есть .my.sig: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
+            $text = 'Найдено: {0}   |   Выбрано: {1}   |   Есть целевая подпись: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
             $skippedCount = @($state.Plan.SkippedReparsePoints).Count
             if ($skippedCount -gt 0) { $text += '   |   Пропущено ссылок: ' + $skippedCount }
             if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие акты в этой папке и её подпапках не найдены.' }
@@ -738,7 +761,16 @@ function Show-ActSignerWindow {
         & $syncAction
         $ui.Form.Refresh()
         try {
-            $plan = & $PlanProvider $sourceRoot $destinationRoot
+            $signatureNaming=$namingModes[$ui.Naming.SelectedIndex]
+            $signerLabel=''
+            if($signatureNaming -ne 'legacy') {
+                $certificateIndex=$ui.Certificate.SelectedIndex
+                if($certificateIndex -lt 0 -or $certificateIndex -ge $state.Certificates.Count) { throw 'Сначала выберите сертификат для имени подписи.' }
+                $info=$state.Certificates[$certificateIndex]
+                if($null -ne $info.PSObject.Properties['FileLabel']) { $signerLabel=[string]$info.FileLabel }
+                else { $signerLabel='cert_'+([string]$info.Thumbprint).Substring(0,12).ToLowerInvariant() }
+            }
+            $plan = & $PlanProvider $sourceRoot $destinationRoot $signatureNaming $signerLabel
             if ($null -eq $plan) { throw 'Не удалось построить список актов.' }
             $state.SuppressGridEvents = $true
             $ui.Grid.SuspendLayout()
@@ -750,19 +782,19 @@ function Show-ActSignerWindow {
                     $neighborCount = 0
                     if ($null -ne $item.PSObject.Properties['NeighborSignatureCount']) { $neighborCount = [int]$item.NeighborSignatureCount }
                     if ($neighborCount -gt 0) { $status = 'Проверить подписи (' + $neighborCount + ')'  }
-                    if ($existing) { $status = 'Есть .my.sig' }
+                    if ($existing) { $status = 'Проверить подпись' }
                     $rowIndex = $ui.Grid.Rows.Add([object[]]@((-not $existing), [string]$item.RelativePath, $status))
                     $row = $ui.Grid.Rows[$rowIndex]
                     $row.Tag = $item
-                    $row.Cells[0].ReadOnly = $existing
+                    $row.Cells[0].ReadOnly = $false
                     $row.Cells[1].ToolTipText = 'Исходный PDF: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
                     $row.Cells[2].ToolTipText = [string]$item.SignaturePath
                     if (-not $existing -and $neighborCount -gt 0) {
-                        $row.Cells[2].ToolTipText = 'Соседние подписи найдены, но ещё не проверены. Галочка включает акт в проверку. Если КриптоПро подтвердит подпись этого PDF выбранным сертификатом, повторной подписи не будет.'
+                        $row.Cells[2].ToolTipText = 'Соседние подписи найдены, но ещё не проверены. Галочка включает акт в проверку. Если математическая проверка подтвердит подпись точных байтов PDF выбранным сертификатом, повторной подписи не будет.'
                     }
                     if ($existing) {
                         $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText
-                        $row.Cells[0].ToolTipText = 'Существующие .my.sig не перезаписываются.'
+                        $row.Cells[0].ToolTipText = 'Можно отметить для проверки существующей подписи. Подтверждённая подпись выбранного сертификата пропускается без ключа; неопределённая блокирует этот акт. Файл подписи не перезаписывается.'
                     }
                 }
             }
@@ -806,13 +838,14 @@ function Show-ActSignerWindow {
         & $invalidatePlan
         & $savePreferences
     }.GetNewClosure())
+    $naming.Add_SelectedIndexChanged({ & $invalidatePlan; & $savePreferences }.GetNewClosure())
     $sourceBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $outputBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $sourceBrowse.Add_Click({ & $browseFolder $false }.GetNewClosure())
     $outputBrowse.Add_Click({ & $browseFolder $true }.GetNewClosure())
     $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())
     $details.Add_Click({ & $openCertificateDetails }.GetNewClosure())
-    $certificateBox.Add_SelectedIndexChanged({ & $showCertificate }.GetNewClosure())
+    $certificateBox.Add_SelectedIndexChanged({ & $invalidatePlan; & $showCertificate }.GetNewClosure())
     $find.Add_Click({ & $findActs }.GetNewClosure())
     $grid.Add_CurrentCellDirtyStateChanged({
         if ($ui.Grid.IsCurrentCellDirty) {
@@ -827,7 +860,7 @@ function Show-ActSignerWindow {
         $state.SuppressGridEvents = $true
         try {
             foreach ($row in $ui.Grid.Rows) {
-                if ($null -ne $row.Tag -and -not [bool]$row.Tag.ExistingSignature) { $row.Cells[0].Value = $true }
+                if ($null -ne $row.Tag) { $row.Cells[0].Value = $true }
             }
         }
         finally { $state.SuppressGridEvents = $false }
@@ -852,11 +885,11 @@ function Show-ActSignerWindow {
             }
             $selectedItems = New-Object 'System.Collections.Generic.List[object]'
             foreach ($row in $ui.Grid.Rows) {
-                if ($null -ne $row.Tag -and -not [bool]$row.Tag.ExistingSignature -and [bool]$row.Cells[0].Value) {
+                if ($null -ne $row.Tag -and [bool]$row.Cells[0].Value) {
                     $selectedItems.Add($row.Tag)
                 }
             }
-            if ($selectedItems.Count -eq 0) { throw 'Отметьте хотя бы один акт без существующей подписи .my.sig.' }
+            if ($selectedItems.Count -eq 0) { throw 'Отметьте хотя бы один акт для проверки или подписания.' }
             $selectedPlan = [pscustomobject]@{
                 Root = $state.Plan.Root
                 OutputRoot = $state.Plan.OutputRoot

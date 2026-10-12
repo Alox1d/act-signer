@@ -16,6 +16,8 @@ try {
     Assert-Settings ($initial.SourceRoot -eq '') 'A new profile must not invent a source folder.'
     Assert-Settings ($initial.SaveBesideSources -eq $true) 'First launch must save beside each act.'
 
+    Assert-Settings ($initial.SignatureNaming -ceq 'signer') 'New profiles must default to signer filenames.'
+
     $source = '\\VBOXSVR\Акты & архив\2026'
     $output = 'D:\Подписи пользователя\Отдельная папка'
     Assert-Settings (Save-ActSignerSettings -Path $path -SourceRoot $source -SeparateOutputRoot $output -SaveBesideSources $false) 'Initial settings save failed.'
@@ -31,7 +33,7 @@ try {
     Assert-Settings ($loaded.SeparateOutputRoot -ceq $output) 'Beside mode erased the separate output preference.'
     Assert-Settings ($loaded.SaveBesideSources -eq $true) 'Explicit beside mode was lost.'
     $raw = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path))
-    Assert-Settings ((@($raw.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'SaveBesideSources,SeparateOutputRoot,SourceRoot') 'Settings contain unexpected data.'
+    Assert-Settings ((@($raw.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'SaveBesideSources,SeparateOutputRoot,SignatureNaming,SourceRoot') 'Settings contain unexpected data.'
     $bytes = [IO.File]::ReadAllBytes($path)
     Assert-Settings ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) 'Settings encoding is not UTF-8 with BOM.'
     Assert-Settings (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($path)) -Filter '*.tmp' -Force).Count -eq 0) 'A staging file remained after saving.'
@@ -60,6 +62,13 @@ try {
     Assert-Settings (-not $saved) 'Occupied destination should not be replaced.'
     Assert-Settings ([IO.File]::ReadAllText($keep) -ceq 'unchanged') 'Occupied destination contents were changed.'
     Assert-Settings (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($occupiedDestination)) -Filter '*.tmp' -Force).Count -eq 0) 'Failed atomic publication left a staging file.'
+    foreach($mode in @('signer','document_signer','legacy')) {
+        Assert-Settings (Save-ActSignerSettings -Path $path -SourceRoot $source -SeparateOutputRoot $output -SaveBesideSources $true -SignatureNaming $mode) 'Naming preference save failed.'
+        $loaded=Get-ActSignerSettings -Path $path
+        Assert-Settings ($loaded.SignatureNaming -ceq $mode -and $loaded.SourceRoot -ceq $source -and $loaded.SaveBesideSources) 'Naming preference damaged folder/mode settings.'
+    }
+    [IO.File]::WriteAllText($path,'{"SignatureNaming":"invalid","SourceRoot":"C:\\Synthetic"}')
+    Assert-Settings ((Get-ActSignerSettings -Path $path).SignatureNaming -ceq 'signer') 'Invalid naming mode must use the safe default.'
     Write-Host 'ActSigner.Settings tests passed.'
 }
 finally {

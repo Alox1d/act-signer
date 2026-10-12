@@ -88,7 +88,7 @@ function Show-ActSignerWindow {
     $configuration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw | ConvertFrom-Json
     $discovery = & $CertificateProvider
     # Use the real entry point's provider and real Core.Get-ActPlan, not a fabricated plan.
-    $plan = & $PlanProvider $configuration.InputRoot $configuration.InputRoot
+    $plan = & $PlanProvider $configuration.InputRoot $configuration.InputRoot signer ivanov
     return [pscustomobject]@{ Plan = $plan; CertificateInfo = $discovery.Certificates[0]; CopyOriginals = $false }
 }
 Export-ModuleMember -Function Show-ActSignerWindow
@@ -103,6 +103,7 @@ $cases = @(
     [pscustomobject]@{ Name = 'all-duplicates'; Kinds = @('duplicate', 'duplicate'); Exit = 0; Inspect = 2; NewSession = 0; Sign = 0; VerifyNew = 0; Close = 0; Already = 2; Status = 'already_signed,already_signed'; Events = 'Inspect,Inspect'; SignError = $false },
     [pscustomobject]@{ Name = 'mixed'; Kinds = @('duplicate', 'new', 'new'); Exit = 0; Inspect = 1; NewSession = 1; Sign = 2; VerifyNew = 2; Close = 1; Already = 1; Status = 'already_signed,signed_verified,signed_verified'; Events = 'Inspect,NewSession,Sign,VerifyNew,Sign,VerifyNew,Close'; SignError = $false },
     [pscustomobject]@{ Name = 'precheck-unverifiable'; Kinds = @('unverifiable'); Exit = 1; Inspect = 1; NewSession = 0; Sign = 0; VerifyNew = 0; Close = 0; Already = 0; Status = 'error'; Events = 'Inspect'; SignError = $false },
+    [pscustomobject]@{ Name = 'precheck-continues'; Kinds = @('unverifiable', 'new'); Exit = 1; Inspect = 1; NewSession = 1; Sign = 1; VerifyNew = 1; Close = 1; Already = 0; Status = 'error,signed_verified'; Events = 'Inspect,NewSession,Sign,VerifyNew,Close'; SignError = $false },
     [pscustomobject]@{ Name = 'signing-error'; Kinds = @('new'); Exit = 1; Inspect = 0; NewSession = 1; Sign = 1; VerifyNew = 0; Close = 1; Already = 0; Status = 'error'; Events = 'NewSession,Sign,Close'; SignError = $true }
 )
 try {
@@ -191,7 +192,7 @@ try {
         foreach ($path in $unchanged.Keys) {
             Assert-Entry ([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -eq $unchanged[$path]) ($case.Name + ': original synthetic PDF/neighbor signature changed.')
         }
-        $published = @(Get-ChildItem -LiteralPath $inputRoot -Filter '*.my.sig' -Recurse -File)
+        $published = @(Get-ChildItem -LiteralPath $inputRoot -Filter 'signature_ivanov.sig' -Recurse -File)
         Assert-Entry ($published.Count -eq $case.VerifyNew) ($case.Name + ': wrong number of newly published signatures.')
         $reports.Add([pscustomobject]@{ Case = $case.Name; ExitCode = $exitCode; Counts = $counts; CsvStatuses = $statuses; PublishedSignatures = $published.Count })
         Write-Host ('CHECK {0}: exit={1}; sessions={2}; signs={3}; verifies={4}; closes={5}; inspections={6}; events={7}' -f $case.Name, $exitCode, $counts.NewSession, $counts.Sign, $counts.VerifyNew, $counts.Close, $counts.Inspect, $events)

@@ -283,7 +283,11 @@ function Invoke-ActBridgeExchange {
     if ($reply.Length -lt 5 -or $reply[0] -cne 'ACTSIGNER/1' -or $reply[3] -cne $Command -or $reply[-1] -cne 'END') { throw 'Некорректный ответ локального процесса КриптоПро.' }
     if ($reply[2] -ceq 'ERROR') {
         if ($reply.Length -ne 8 -or $reply[4] -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $reply[5] -cnotmatch '^[A-Z_]{1,32}$' -or $reply[6] -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректный код ошибки локального процесса КриптоПро.' }
-        throw (Get-ActBridgeErrorText $reply[4] $reply[5] $reply[6])
+        $failure=[InvalidOperationException]::new((Get-ActBridgeErrorText $reply[4] $reply[5] $reply[6]))
+        if($Command -in @('SELECT','SIGN','VERIFY')) {
+            $failure.Data['ActSignerFailure']=if($reply[6] -in @('0x80090036','0x8010006E','0x800704C7')){'cancelled'}else{'session'}
+        }
+        throw $failure
     }
     if ($reply[2] -cne 'OK') { throw 'Локальный процесс КриптоПро не подтвердил операцию.' }
     if ($reply.Length -eq 5) { return ,([string[]]@()) }
@@ -362,7 +366,7 @@ function ConvertFrom-ActBridgeCertificate {
             Thumbprint = $actual; DisplayName = $name; Subject = $certificate.Subject; Issuer = $certificate.Issuer
             NotBefore = $certificate.NotBefore; NotAfter = $certificate.NotAfter
             Source = $(if ($Kind -eq 100) { 'Контейнер КриптоПро' } else { 'Личное хранилище Windows' })
-            StoreKind = $Kind
+            StoreKind = $Kind; FileLabel = $(Initialize-ActNativeCmsInspector; [ActSigner.NativeCmsInspector]::FileLabel($Raw))
         }
     } finally { $certificate.Dispose() }
 }
@@ -514,32 +518,192 @@ function ConvertTo-ActExistingSignatureDer {
     return ,$raw
 }
 
-function Initialize-ActCmsDecoder {
-    if ('System.Security.Cryptography.Pkcs.SignedCms' -as [type]) { return }
-    try {
-        if ($PSVersionTable.PSEdition -eq 'Desktop') { Add-Type -AssemblyName System.Security -ErrorAction Stop }
-        else { Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction Stop }
-    } catch { throw 'Не удалось загрузить системный модуль .NET для чтения CMS/PKCS7. Проверка соседних подписей остановлена.' }
-}
+function Initialize-ActNativeCmsInspector {
+    if ('ActSigner.NativeCmsInspector' -as [type]) { return }
+    Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+namespace ActSigner {
+    public sealed class NativeCmsSigner {
+        public string Thumbprint, SignatureStatus, HResult;
+        public DateTime NotBeforeUtc, NotAfterUtc;
+    }
+    // Read-only CryptoAPI: no user stores, chain validation, private keys or PIN.
+    public static class NativeCmsInspector {
+        const uint Encoding = 0x10001, SignerIdParam = 38, FindCertId = 0x100000;
+        const int MaxCount = 4096, MaxBytes = 67108864;
+        [StructLayout(LayoutKind.Sequential)] struct VerifyPara {
+            public uint Size, Encoding;
+            public IntPtr Provider, Callback, Arg;
+        }
+        [DllImport("crypt32.dll", SetLastError=true)] static extern IntPtr CryptMsgOpenToDecode(uint encoding, uint flags, uint type, IntPtr provider, IntPtr recipient, IntPtr stream);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern bool CryptMsgUpdate(IntPtr message, byte[] bytes, uint length, bool final);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern bool CryptMsgGetParam(IntPtr message, uint type, uint index, IntPtr data, ref uint length);
+        [DllImport("crypt32.dll")] static extern bool CryptMsgClose(IntPtr message);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern IntPtr CertOpenStore(IntPtr provider, uint encoding, IntPtr crypto, uint flags, IntPtr data);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern bool CertAddEncodedCertificateToStore(IntPtr store, uint encoding, byte[] bytes, uint length, uint disposition, IntPtr context);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern IntPtr CertFindCertificateInStore(IntPtr store, uint encoding, uint flags, uint type, IntPtr criteria, IntPtr previous);
+        [DllImport("crypt32.dll")] static extern bool CertFreeCertificateContext(IntPtr context);
+        [DllImport("crypt32.dll")] static extern bool CertCloseStore(IntPtr store, uint flags);
+        [DllImport("crypt32.dll", SetLastError=true)] static extern bool CryptVerifyDetachedMessageSignature(ref VerifyPara parameters, uint index, byte[] signature, uint signatureLength, uint count, IntPtr[] contents, uint[] lengths, out IntPtr signer);
 
-function Assert-ActDetachedCmsEnvelope {
-    param([byte[]]$SignatureBytes)
-    # Decode only. Neither certificate identity nor validity comes from this parser.
-    # SignedCms.Detached reflects its constructor, not the decoded envelope.
-    Initialize-ActCmsDecoder
-    $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
-    try { $cms.Decode($SignatureBytes) } catch {
-        throw [FormatException]::new('Соседний файл не удалось разобрать как подписанное сообщение CMS/PKCS7.')
+        [DllImport("crypt32.dll", CharSet=CharSet.Unicode)] static extern uint CertGetNameString(IntPtr certificate, uint type, uint flags, [MarshalAs(UnmanagedType.LPStr)] string attribute, System.Text.StringBuilder text, uint size);
+        public static string FileLabel(byte[] raw) {
+            using (var certificate = new X509Certificate2(raw)) {
+                string fallback = "cert_" + certificate.Thumbprint.Substring(0,12).ToLowerInvariant();
+                uint count = CertGetNameString(certificate.Handle, 3, 0, "2.5.4.4", null, 0);
+                if (count < 2 || count > 1024) return fallback;
+                var text = new System.Text.StringBuilder((int)count);
+                if (CertGetNameString(certificate.Handle, 3, 0, "2.5.4.4", text, count) != count) return fallback;
+                string alphabet = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя";
+                string[] latin = {"a","b","v","g","d","e","e","zh","z","i","y","k","l","m","n","o","p","r","s","t","u","f","kh","ts","ch","sh","shch","","y","","e","yu","ya"};
+                var label = new System.Text.StringBuilder();
+                foreach (char c in text.ToString().ToLowerInvariant()) {
+                    int i = alphabet.IndexOf(c);
+                    if (i >= 0) label.Append(latin[i]);
+                    else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') label.Append(c);
+                    else label.Append('_');
+                }
+                string value = System.Text.RegularExpressions.Regex.Replace(label.ToString(), "_+", "_").Trim('_','-');
+                if (value.Length > 80) value = value.Substring(0,80).TrimEnd('_','-');
+                return value.Length == 0 ? fallback : value;
+            }
+        }
+        static void Native(bool success) { if (!success) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        static IntPtr Parameter(IntPtr message, uint type, uint index, out uint length) {
+            length = 0; Native(CryptMsgGetParam(message, type, index, IntPtr.Zero, ref length));
+            if (length > MaxBytes) throw new FormatException("CMS_PARAMETER_LIMIT");
+            IntPtr memory = Marshal.AllocHGlobal((int)Math.Max(1, length));
+            try { Native(CryptMsgGetParam(message, type, index, memory, ref length)); return memory; }
+            catch { Marshal.FreeHGlobal(memory); throw; }
+        }
+        static byte[] Bytes(IntPtr message, uint type, uint index) {
+            uint length; IntPtr memory = Parameter(message, type, index, out length);
+            try { byte[] bytes = new byte[length]; Marshal.Copy(memory, bytes, 0, (int)length); return bytes; }
+            finally { Marshal.FreeHGlobal(memory); }
+        }
+        static uint Number(IntPtr message, uint type) {
+            byte[] bytes = Bytes(message, type, 0);
+            if (bytes.Length != 4) throw new FormatException("CMS_NUMBER");
+            return BitConverter.ToUInt32(bytes, 0);
+        }
+        // CryptoAPI can accept a valid message prefix. Require exactly one BER envelope,
+        // including the indefinite-length form produced by installed CryptoPro.
+        static void EnvelopeEnd(byte[] bytes, ref int offset, int depth, ref int nodes) {
+            if (depth > 64 || ++nodes > 65536 || offset >= bytes.Length) throw new FormatException("CMS_ENVELOPE_LIMIT");
+            int tag = bytes[offset++];
+            if (tag == 0) throw new FormatException("CMS_UNEXPECTED_EOC");
+            if ((tag & 31) == 31) {
+                int size = 0, part;
+                do { if (offset >= bytes.Length || ++size > 8) throw new FormatException("CMS_TAG"); part = bytes[offset++]; } while ((part & 128) != 0);
+            }
+            if (offset >= bytes.Length) throw new FormatException("CMS_LENGTH");
+            int first = bytes[offset++];
+            if (first == 128) {
+                if ((tag & 32) == 0) throw new FormatException("CMS_PRIMITIVE_INDEFINITE");
+                while (true) {
+                    if (offset + 1 >= bytes.Length) throw new FormatException("CMS_MISSING_EOC");
+                    if (bytes[offset] == 0 && bytes[offset + 1] == 0) { offset += 2; return; }
+                    EnvelopeEnd(bytes, ref offset, depth + 1, ref nodes);
+                }
+            }
+            long length = first;
+            if ((first & 128) != 0) {
+                int count = first & 127;
+                if (count == 0 || count > 4 || offset + count > bytes.Length) throw new FormatException("CMS_LENGTH");
+                length = 0;
+                for (int i = 0; i < count; i++) length = (length << 8) | bytes[offset++];
+            }
+            if (length > bytes.Length - offset) throw new FormatException("CMS_TRUNCATED");
+            offset += (int)length;
+        }
+        public static NativeCmsSigner[] Inspect(byte[] pdf, byte[] signature) {
+            if (pdf == null || signature == null || pdf.Length < 1 || signature.Length < 1 || pdf.Length > MaxBytes || signature.Length > MaxBytes) throw new FormatException("CMS_SIZE");
+            int end = 0, nodes = 0;
+            if (signature[0] != 0x30) throw new FormatException("CMS_NOT_SEQUENCE");
+            EnvelopeEnd(signature, ref end, 0, ref nodes);
+            if (end != signature.Length) throw new FormatException("CMS_TRAILING_BYTES");
+            IntPtr message = IntPtr.Zero, store = IntPtr.Zero;
+            var certificates = new List<X509Certificate2>();
+            try {
+                message = CryptMsgOpenToDecode(Encoding, 0, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (message == IntPtr.Zero) Native(false);
+                Native(CryptMsgUpdate(message, signature, (uint)signature.Length, true));
+                if (Number(message, 1) != 2) throw new FormatException("CMS_NOT_SIGNED");
+                string oid = System.Text.Encoding.ASCII.GetString(Bytes(message, 4, 0)).TrimEnd('\0');
+                if (oid != "1.2.840.113549.1.7.1" || Bytes(message, 2, 0).Length != 0) throw new FormatException("CMS_NOT_DETACHED_DATA");
+                uint count = Number(message, 5), certCount = Number(message, 11);
+                if (count < 1 || count > MaxCount || certCount > MaxCount) throw new FormatException("CMS_COUNT");
+                // Bound repeated native hashing of an untrusted multi-signer file.
+                if ((long)pdf.Length * count > 512L * 1024 * 1024) throw new FormatException("CMS_WORK_LIMIT");
+                store = CertOpenStore(new IntPtr(2), 0, IntPtr.Zero, 0x2000, IntPtr.Zero); // memory store
+                if (store == IntPtr.Zero) Native(false);
+                for (uint i = 0; i < certCount; i++) {
+                    byte[] certificate = Bytes(message, 12, i);
+                    if (certificate.Length > 1048576) throw new FormatException("CMS_CERTIFICATE_LIMIT");
+                    // ADD_ALWAYS preserves ambiguous issuer/serial or key-ID matches.
+                    Native(CertAddEncodedCertificateToStore(store, Encoding, certificate, (uint)certificate.Length, 4, IntPtr.Zero));
+                }
+                for (uint i = 0; i < count; i++) {
+                    uint length; IntPtr id = Parameter(message, SignerIdParam, i, out length), context = IntPtr.Zero;
+                    X509Certificate2 selected = null; string selectedRaw = null;
+                    try {
+                        int matches = 0;
+                        while (true) {
+                            IntPtr previous = context; context = IntPtr.Zero;
+                            context = CertFindCertificateInStore(store, Encoding, 0, FindCertId, id, previous);
+                            if (context == IntPtr.Zero) {
+                                if (unchecked((uint)Marshal.GetLastWin32Error()) != 0x80092004) Native(false);
+                                break;
+                            }
+                            if (++matches > MaxCount) throw new FormatException("CMS_CERTIFICATE_LIMIT");
+                            using (var candidate = new X509Certificate2(context)) {
+                                string raw = Convert.ToBase64String(candidate.RawData);
+                                if (selectedRaw != null && selectedRaw != raw) throw new FormatException("CMS_AMBIGUOUS_SIGNER");
+                                if (selected == null) { selected = new X509Certificate2(candidate.RawData); selectedRaw = raw; }
+                            }
+                        }
+                        if (selected == null) throw new FormatException("CMS_MISSING_SIGNER_CERTIFICATE");
+                        certificates.Add(selected); selected = null;
+                    } finally {
+                        if (selected != null) selected.Dispose();
+                        if (context != IntPtr.Zero) CertFreeCertificateContext(context);
+                        Marshal.FreeHGlobal(id);
+                    }
+                }
+                var result = new NativeCmsSigner[count];
+                var pin = GCHandle.Alloc(pdf, GCHandleType.Pinned);
+                try {
+                    for (uint i = 0; i < count; i++) {
+                        var certificate = certificates[(int)i]; IntPtr actual = IntPtr.Zero;
+                        var item = new NativeCmsSigner { Thumbprint = certificate.Thumbprint, SignatureStatus = "unverifiable", HResult = "0x00000000", NotBeforeUtc = certificate.NotBefore.ToUniversalTime(), NotAfterUtc = certificate.NotAfter.ToUniversalTime() };
+                        try {
+                            var parameters = new VerifyPara { Size = (uint)Marshal.SizeOf(typeof(VerifyPara)), Encoding = Encoding };
+                            bool verified = CryptVerifyDetachedMessageSignature(ref parameters, i, signature, (uint)signature.Length, 1, new[] { pin.AddrOfPinnedObject() }, new[] { (uint)pdf.Length }, out actual);
+                            int error = verified ? 0 : Marshal.GetLastWin32Error();
+                            if (verified && actual != IntPtr.Zero) {
+                                using (var actualCertificate = new X509Certificate2(actual)) {
+                                    if (Convert.ToBase64String(actualCertificate.RawData) != Convert.ToBase64String(certificate.RawData)) throw new FormatException("CMS_SIGNER_MISMATCH");
+                                }
+                                item.SignatureStatus = "valid";
+                            } else item.HResult = "0x" + error.ToString("X8");
+                        } finally { if (actual != IntPtr.Zero) CertFreeCertificateContext(actual); }
+                        result[i] = item;
+                    }
+                } finally { pin.Free(); }
+                return result;
+            } finally {
+                foreach (var certificate in certificates) certificate.Dispose();
+                if (store != IntPtr.Zero) CertCloseStore(store, 0);
+                if (message != IntPtr.Zero) CryptMsgClose(message);
+            }
+        }
     }
-    if ($cms.ContentInfo.ContentType.Value -cne '1.2.840.113549.1.7.1') {
-        throw [FormatException]::new('В соседней подписи обнаружен неподдерживаемый тип вложенного содержимого.')
-    }
-    if ($cms.ContentInfo.Content.Length -ne 0) {
-        throw [FormatException]::new('Соседняя подпись содержит вложенный документ. Автоматическая проверка поддерживает отделённые подписи; проверьте этот файл вручную.')
-    }
-    if ($cms.SignerInfos.Count -lt 1 -or $cms.SignerInfos.Count -gt 4096) {
-        throw [FormatException]::new('В соседней подписи отсутствуют подписанты или превышен допустимый предел 4096 подписантов.')
-    }
+}
+'@
 }
 
 function Get-ActExistingSignatureInfo {
@@ -550,40 +714,26 @@ function Get-ActExistingSignatureInfo {
     if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер проверяемого PDF должен быть от 1 байта до 64 МиБ.' }
     try {
         [byte[]]$signature = ConvertTo-ActExistingSignatureDer $SignatureBytes
-        Assert-ActDetachedCmsEnvelope $signature
+        Initialize-ActNativeCmsInspector
+        $signers = [ActSigner.NativeCmsInspector]::Inspect($PdfBytes, $signature)
+        return [pscustomobject]@{
+            Status = 'identified'; Signers = @($signers)
+            Thumbprints = @($signers | Where-Object { $_.SignatureStatus -ceq 'valid' } | ForEach-Object { $_.Thumbprint })
+            TrustStatus = 'not_checked'
+            Message = 'Состав подписантов установлен. Математическая проверка выполнена отдельно; доверие, сроки цепочки и отзыв не проверялись.'
+        }
     } catch [FormatException] {
-        return [pscustomobject]@{ Status = 'unverifiable'; Thumbprints = [string[]]@(); Message = $_.Exception.Message }
+        return [pscustomobject]@{ Status = 'unverifiable'; Signers = @(); Thumbprints = @(); TrustStatus = 'not_checked'; Message = $_.Exception.Message }
+    } catch {
+        $error = $_.Exception
+        while ($null -ne $error.InnerException) { $error = $error.InnerException }
+        $detail = 'CMS_DECODE'
+        if ($error -is [FormatException] -and $error.Message -cmatch '^CMS_[A-Z_]+$') { $detail = $error.Message }
+        $hr = '0x{0:X8}' -f ([long]$error.HResult -band 4294967295L)
+        if ($error -is [ComponentModel.Win32Exception]) { $hr = '0x{0:X8}' -f ([long]$error.NativeErrorCode -band 4294967295L) }
+        return [pscustomobject]@{ Status = 'unverifiable'; Signers = @(); Thumbprints = @(); TrustStatus = 'not_checked'; Message = ('Не удалось надёжно определить всех подписантов CMS. Код {0}; HRESULT {1}. Автоматическое подписание этого акта запрещено.' -f $detail, $hr) }
     }
-    # A fresh read-only worker; no SELECT/SIGN, certificate store, token or PIN.
-    # Transport/timeout/protocol failures deliberately throw, never mean "absent".
-    $payload = Invoke-ActBridgeOnce 'INSPECT' 0 '' $PdfBytes $signature 60000
-    $index = 0
-    $status = Read-ActBridgeField $payload ([ref]$index)
-    if ($status -cnotmatch '^(valid|different_content|unverifiable)$') { throw 'Неизвестный результат проверки соседней подписи.' }
-    $count = Read-ActBridgeNumber $payload ([ref]$index) 4096
-    $thumbprints = New-Object 'System.Collections.Generic.List[string]'
-    if ($status -ceq 'valid') {
-        if ($count -lt 1) { throw 'КриптоПро не подтвердил ни одного подписанта соседней подписи.' }
-        for ($i = 0; $i -lt $count; $i++) {
-            $thumbprint = Read-ActBridgeField $payload ([ref]$index)
-            if ($thumbprint -cnotmatch '^[0-9A-F]{40}$') { throw 'КриптоПро вернул некорректный отпечаток подписанта соседней подписи.' }
-            $thumbprints.Add($thumbprint)
-        }
-        $message = 'Подпись проверена для этого PDF.'
-    } else {
-        if ($count -ne 0) { throw 'Неподтверждённая соседняя подпись не должна содержать подтверждённых подписантов.' }
-        $stage = Read-ActBridgeField $payload ([ref]$index)
-        $code = Read-ActBridgeField $payload ([ref]$index)
-        $hresult = Read-ActBridgeField $payload ([ref]$index)
-        if ($stage -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $code -cnotmatch '^[A-Z_]{1,32}$' -or $hresult -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректная диагностика проверки соседней подписи.' }
-        if ($status -ceq 'different_content') {
-            if ($stage -cne 'SignedData.VerifyCades' -or $code -cne 'NATIVE' -or $hresult -cne '0x80091007') { throw 'КриптоПро не подтвердил несовпадение содержимого соседней подписи.' }
-            $message = 'Содержимое соседней подписи не совпало с этим PDF.'
-        }
-        else { $message = ('Не удалось проверить соседнюю подпись. Этап {0}; код {1}; HRESULT {2}.' -f $stage, $code, $hresult) }
-    }
-    Assert-ActBridgeEnd $payload $index
-    return [pscustomobject]@{ Status = $status; Thumbprints = [string[]]$thumbprints.ToArray(); Message = $message }
+
 }
 
 function Close-ActCryptoSession {

@@ -47,8 +47,8 @@ try {
     Write-Host 'Подключите флешку или токен к Windows внутри VM.'
     Write-Host 'В окне выберите папки, сертификат и акты для подписи.'
     $selection = Show-ActSignerWindow -CertificateProvider { Get-ActCertificates } -PlanProvider {
-        param($Root, $OutputRoot)
-        Get-ActPlan -Root $Root -OutputRoot $OutputRoot
+        param($Root, $OutputRoot, $SignatureNaming, $SignerLabel)
+        Get-ActPlan -Root $Root -OutputRoot $OutputRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel
     }
     if ($null -eq $selection) {
         Write-Host 'Запуск отменён. Подписание не начиналось.'
@@ -87,6 +87,7 @@ try {
                 Write-Host ('[{0}/{1}] {2}' -f $Event.Index, $Event.Total, $Event.Item.RelativePath)
                 Write-Host ('  ' + $Event.Message)
             }
+            elseif ($Event.Status -in @('foreign_signature','cancelled')) { Write-Host ('  ' + $Event.Message) -ForegroundColor Yellow }
             elseif ($Event.Status -eq 'signing') {
                 Write-Host ('[{0}/{1}] {2}' -f $Event.Index, $Event.Total, $Event.Item.RelativePath)
             }
@@ -111,14 +112,17 @@ try {
         Write-Host ('Создано и проверено: {0}' -f $result.CompletedCount)
         Write-Host ('Пропущено всего: {0}' -f $result.SkippedCount)
         Write-Host ('Уже подписано выбранным сертификатом: {0}' -f $result.AlreadySignedCount)
+        Write-Host ('Отменено: {0}' -f $result.CancelledCount)
         Write-Host ('Ошибок: {0}; не обработано: {1}' -f $result.ErrorCount, $result.NotProcessedCount)
         Write-Host ('Журнал: {0}' -f $result.LogPath)
+        if ($result.ErrorCount -gt 0 -or $result.CancelledCount -gt 0) { $exitCode = 1 }
         if ($result.Stopped) {
             $exitCode = 1
             Write-Host 'Пакет остановлен. Причина указана выше и в журнале.' -ForegroundColor Yellow
             Write-Host 'После устранения причины запустите программу снова: готовые подписи не перезаписываются.'
         }
         else {
+            if ($result.ErrorCount -gt 0) { Write-Host 'Обработка завершена с ошибками отдельных актов. Причины указаны в журнале.' -ForegroundColor Yellow }
             Write-Host ('Обработка завершена. Новых подписей: {0}; пропущено: {1}.' -f $result.CompletedCount, $result.SkippedCount) -ForegroundColor Green
             if ($result.CompletedCount -gt 0) { Write-Host ('Новые файлы: {0}' -f $selection.Plan.OutputRoot) }
         }

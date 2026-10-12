@@ -18,6 +18,7 @@ function Get-ActSignerSettings {
         SourceRoot = ''
         SeparateOutputRoot = ''
         SaveBesideSources = $true
+        SignatureNaming = 'signer'
     }
     try {
         if ([string]::IsNullOrWhiteSpace($Path)) { $Path = Get-ActSignerSettingsPath }
@@ -37,6 +38,8 @@ function Get-ActSignerSettings {
                 $settings.$name = $property.Value.Trim()
             }
         }
+        $naming=$loaded.PSObject.Properties['SignatureNaming']
+        if($null -ne $naming -and $naming.Value -is [string] -and $naming.Value -cin @('signer','document_signer','legacy')) { $settings.SignatureNaming=$naming.Value }
         $mode = $loaded.PSObject.Properties['SaveBesideSources']
         if ($null -ne $mode -and $mode.Value -is [bool]) {
             $settings.SaveBesideSources = $mode.Value
@@ -55,7 +58,8 @@ function Save-ActSignerSettings {
         [AllowEmptyString()][string]$SourceRoot = '',
         [AllowEmptyString()][string]$SeparateOutputRoot = '',
         [bool]$SaveBesideSources = $true,
-        [string]$Path
+        [string]$Path,
+        [ValidateSet('signer','document_signer','legacy')][string]$SignatureNaming = 'signer'
     )
 
     $temporaryPath = $null
@@ -70,6 +74,7 @@ function Save-ActSignerSettings {
             SourceRoot = ([string]$SourceRoot).Trim()
             SeparateOutputRoot = ([string]$SeparateOutputRoot).Trim()
             SaveBesideSources = $SaveBesideSources
+            SignatureNaming = $SignatureNaming
         }
         $json = ConvertTo-Json -InputObject $settings -Depth 2
         $temporaryPath = [IO.Path]::Combine($directory, '.settings-' + [guid]::NewGuid().ToString('N') + '.tmp')

@@ -51,6 +51,9 @@ jobs:
       - name: Verify CMS parsing and CScript bridge contracts
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.CryptoPro.Tests.ps1
+      - name: Verify native CMS identity and mathematical signatures with synthetic RSA
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Cms.Tests.ps1
       - name: Verify settings preservation
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Settings.Tests.ps1

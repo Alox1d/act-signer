@@ -181,7 +181,7 @@ try {
         Assert-True ((Get-Status $Result) -eq 'error') 'Unresolved neighbor must stop with an error.'
         Assert-True ($script:mockSignCalls -eq 0 -and $script:mockVerifyCalls -eq 0) 'Unresolved neighbor invoked private-key or verification callbacks.'
         Assert-True (-not [IO.File]::Exists($Case.Plan.Items[0].SignaturePath)) 'Unresolved neighbor published an own signature.'
-        Assert-True $Result.Stopped 'Unresolved neighbor did not stop the batch.'
+        Assert-True (-not $Result.Stopped) 'A document error must not stop independent acts.'
         Assert-True ($Result.Rows[0].Message -like '*Проверка соседних подписей*') 'Error must explain the precheck stage.'
     }
     $case = New-NeighborCase 'arbitrary filename'
@@ -283,7 +283,7 @@ try {
     Write-Fixture (Join-Path $case.Root 'uncertain.sig') 'UNKNOWN'
     $case.Plan = Get-ActPlan -Root $case.Root -OutputRoot $case.Output
     $result = Invoke-NeighborCase $case
-    Assert-True ((Get-Status $result) -eq 'error,not_processed') 'An unresolved precheck must stop subsequent acts.'
+    Assert-True ((Get-Status $result) -eq 'error,error' -and -not $result.Stopped) 'Each act sharing an unresolved neighbor must receive its own error.'
     Assert-True ($script:mockSignCalls -eq 0 -and $script:mockVerifyCalls -eq 0) 'An unresolved batch used signing callbacks.'
     $case = New-NeighborCase 'read error then duplicate'
     Write-Fixture (Join-Path $case.Root '00-unreadable.sig') 'THROW'
@@ -300,7 +300,7 @@ try {
     }.GetNewClosure()
     $script:mockSignCalls = 0; $script:mockVerifyCalls = 0
     $result = Invoke-ActBatch -Plan $case.Plan -Thumbprint $thumb -SignBlock $lateSign -VerifyBlock $verify -ExistingSignatureInspector $neighborInspector -LogRoot (Join-Path $testRoot 'Neighbor logs')
-    Assert-True ((Get-Status $result) -eq 'error' -and $result.Stopped) 'Late signing-time neighbor must block publication.'
+    Assert-True ((Get-Status $result) -eq 'error' -and -not $result.Stopped) 'Late signing-time neighbor must block publication for that act.'
     Assert-True ($script:mockSignCalls -eq 1 -and $script:mockVerifyCalls -eq 1) 'Signing-time race callback counts changed.'
     Assert-True (-not [IO.File]::Exists($case.Plan.Items[0].SignaturePath)) 'A late neighbor allowed new signature publication.'
     Assert-True ($result.Rows[0].Message -like '*Проверка соседних подписей*') 'Publication race must name the neighboring-signature precheck stage.'
@@ -327,6 +327,48 @@ try {
     }.GetNewClosure()
     Assert-NeighborBlocked (Invoke-NeighborCase $case -Progress $progress) $case
     Write-Host 'PASS 13: pre-sign progress cannot bypass the final neighboring-signature check'
+
+    $case = New-NeighborCase 'foreign expired chain'
+    Write-Fixture (Join-Path $case.Root 'signature.sig') 'synthetic-native-cms'
+    $foreign = { param($p,$s) [pscustomobject]@{Status='identified'; Signers=@([pscustomobject]@{Thumbprint=$otherThumb;SignatureStatus='valid';HResult='0x00000000'});TrustStatus='not_checked';Message='Trust unchecked'} }.GetNewClosure()
+    $result = Invoke-NeighborCase $case -Inspector $foreign
+    Assert-True ((Get-Status $result) -eq 'signed_verified') 'Foreign mathematical signature must permit a separate own signature without chain trust.'
+    Assert-True ($result.Rows[0].Message -match 'других сертификатов') 'Foreign signature and unchecked trust must remain visible in the journal.'
+
+    foreach($selectedStatus in @('valid','unverifiable')) {
+        $case = New-NeighborCase ('native parallel '+$selectedStatus)
+        Write-Fixture (Join-Path $case.Root 'parallel.sig') 'synthetic-native-cms'
+        $inspector = { param($p,$s) [pscustomobject]@{Status='identified';Signers=@([pscustomobject]@{Thumbprint=$otherThumb;SignatureStatus='unverifiable';HResult='0x80090006'},[pscustomobject]@{Thumbprint=$thumb;SignatureStatus=$selectedStatus;HResult='0x80090006'});TrustStatus='not_checked';Message='Synthetic per-signer results'} }.GetNewClosure()
+        $result=Invoke-NeighborCase $case -Inspector $inspector
+        if($selectedStatus -eq 'valid'){Assert-NeighborSkip $result $case 'parallel.sig'}
+        else {Assert-True ((Get-Status $result) -eq 'error' -and -not $result.Stopped -and $script:mockSignCalls -eq 0) 'An unresolved possible own signature must block only that act without key access.'}
+    }
+    $case=New-NeighborCase 'independent after unknown'
+    $second=Join-Path $case.Root 'next/Акт_оказанных_услуг.pdf';Write-Fixture $second '%PDF-1.4 independent next'
+    Write-Fixture (Join-Path $case.Root 'unknown.sig') 'UNKNOWN'
+    $case.Plan=Get-ActPlan -Root $case.Root -OutputRoot $case.Output
+    $case.Plan.Items=@($case.Plan.Items | Where-Object { $_.SourcePath -eq $case.Source }) + @($case.Plan.Items | Where-Object { $_.SourcePath -eq $second })
+    $result=Invoke-NeighborCase $case
+    Assert-True ((Get-Status $result) -eq 'error,signed_verified' -and -not $result.Stopped) 'A document precheck error must leave the independent next document processable.'
+    Assert-True ($script:mockSignCalls -eq 1 -and $result.ErrorCount -eq 1 -and $result.CompletedCount -eq 1) 'Independent document counts/key calls are incorrect.'
+    $cancel = { param($p) $e=[OperationCanceledException]::new('Synthetic token cancellation');$e.Data['ActSignerFailure']='cancelled';throw $e }
+    $cancelPlan=Get-ActPlan -Root $failureRoot -OutputRoot $failureOutput
+    $result=Invoke-ActBatch -Plan $cancelPlan -Thumbprint $thumb -SignBlock $cancel -VerifyBlock $verify -LogRoot (Join-Path $testRoot 'Cancelled logs')
+    Assert-True ($result.Stopped -and $result.StopReason -eq 'cancelled' -and (Get-Status $result) -eq 'cancelled,not_processed') 'User cancellation must stop separately from document errors.'
+    $case=New-NeighborCase 'signer filenames'
+    foreach($mode in @('signer','document_signer','legacy')) {
+        $named=Get-ActPlan -Root $case.Root -OutputRoot $case.Root -SignatureNaming $mode -SignerLabel 'ivanov'
+        $expected=if($mode -eq 'signer'){'signature_ivanov.sig'}elseif($mode -eq 'document_signer'){'Акт_оказанных_услуг_ivanov.sig'}else{'Акт_оказанных_услуг.my.sig'}
+        Assert-True ([IO.Path]::GetFileName($named.Items[0].SignaturePath) -ceq $expected) 'Naming mode must select the intended no-overwrite target.'
+    }
+    $unsafeRejected=$false
+    try { Get-ActPlan -Root $case.Root -OutputRoot $case.Root -SignatureNaming signer -SignerLabel '../escape' | Out-Null } catch {$unsafeRejected=$true}
+    Assert-True $unsafeRejected 'Untrusted signer labels must not escape the act folder.'
+    Write-Fixture (Join-Path $case.Root 'Акт_выполненных_работ.pdf') '%PDF-1.4 second act sharing a folder'
+    $case.Plan=Get-ActPlan -Root $case.Root -OutputRoot $case.Root -SignatureNaming signer -SignerLabel ivanov
+    $result=Invoke-NeighborCase $case
+    Assert-True ((Get-Status $result) -ceq 'error,error' -and $script:mockSignCalls -eq 0 -and -not $result.Stopped) 'Two acts sharing a signer target must fail before any private-key call; no overwrite or automatic rename.'
+    Write-Host 'PASS 14: native signer policy, foreign trust messages, independent documents and cancellation.'
 
 
 
