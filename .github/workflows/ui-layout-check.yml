@@ -2,7 +2,17 @@ name: Native Windows UI check
 
 on:
   push:
-    branches: [ui-layout-check]
+    branches: [main, ui-layout-check]
+    paths:
+      - 'ActSigner.UI.psm1'
+      - 'ActSigner.UI.Tests.ps1'
+      - '.github/workflows/ui-layout-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ActSigner.UI.psm1'
+      - 'ActSigner.UI.Tests.ps1'
+      - '.github/workflows/ui-layout-check.yml'
 
 permissions:
   contents: read

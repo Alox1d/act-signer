@@ -28,3 +28,6 @@ _ActSigner_logs/
 *.[tT][mM][pP]
 *.[zZ][iI][pP]
 TestResults/
+
+# Synthetic screenshots and local UI measurements
+ui-test-artifacts/

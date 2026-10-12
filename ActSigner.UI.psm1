@@ -118,8 +118,6 @@ function Show-ActSignerWindow {
     $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $availableWidth = [Math]::Max(200, $workArea.Width - 32)
     $availableHeight = [Math]::Max(200, $workArea.Height - 32)
-    $form.MinimumSize = New-Object System.Drawing.Size([Math]::Min(640, $availableWidth), [Math]::Min(480, $availableHeight))
-    $form.Size = New-Object System.Drawing.Size([Math]::Min(1180, $availableWidth), [Math]::Min(800, $availableHeight))
 
     # Only the grid scrolls. Setup rows use their preferred height; the acts
     # receive the remaining space and the footer stays inside the window.
@@ -379,6 +377,7 @@ function Show-ActSignerWindow {
     $summary = New-Object System.Windows.Forms.Label
     $ui.Summary = $summary
     $summary.Dock = 'Fill'
+    $summary.AutoSize = $true
     $summary.Margin = New-Object System.Windows.Forms.Padding(0)
     $summary.AutoEllipsis = $true
     $summary.TextAlign = 'MiddleLeft'
@@ -560,8 +559,6 @@ function Show-ActSignerWindow {
             $area = [System.Windows.Forms.Screen]::FromControl($ui.Form).WorkingArea
             $width = [Math]::Max(200, $area.Width - 32)
             $height = [Math]::Max(200, $area.Height - 32)
-            $dialog.MinimumSize = New-Object System.Drawing.Size([Math]::Min(480, $width), [Math]::Min(300, $height))
-            $dialog.Size = New-Object System.Drawing.Size([Math]::Min(820, $width), [Math]::Min(520, $height))
             $detailsLayout = New-Object System.Windows.Forms.TableLayoutPanel
             $detailsLayout.Dock = 'Fill'
             $detailsLayout.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 10)
@@ -597,6 +594,9 @@ function Show-ActSignerWindow {
             $dialog.AcceptButton = $close
             $dialog.CancelButton = $close
             $dialog.ResumeLayout($true)
+            $dialog.PerformAutoScale()
+            $dialog.MinimumSize = New-Object System.Drawing.Size([Math]::Min(480, $width), [Math]::Min(300, $height))
+            $dialog.Size = New-Object System.Drawing.Size([Math]::Min(820, $width), [Math]::Min(520, $height))
             [void]$dialog.ShowDialog($ui.Form)
         }
         finally { $dialog.Dispose() }
@@ -883,6 +883,10 @@ function Show-ActSignerWindow {
     & $syncOutputToSource
     & $syncAction
     $form.ResumeLayout($true)
+    $form.PerformAutoScale()
+    # Apply screen-relative window bounds after the initial font scaling.
+    $form.MinimumSize = New-Object System.Drawing.Size([Math]::Min(640, $availableWidth), [Math]::Min(480, $availableHeight))
+    $form.Size = New-Object System.Drawing.Size([Math]::Min(1180, $availableWidth), [Math]::Min(800, $availableHeight))
     try {
         [void]$form.ShowDialog()
         return $state.Result

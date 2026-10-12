@@ -84,6 +84,8 @@ $measure = {
     param([string]$Name, [int]$MinimumRows)
     $form = $state.Form
     $grid = $state.Grid
+    $requestedSize = $Name.Split('x')
+    & $assert ($form.Width -eq [int]$requestedSize[0] -and $form.Height -eq [int]$requestedSize[1]) ($Name + ': actual outer form dimensions must equal the requested size, without MinimumSize expansion.')
     $visible = & $visibleRectangle $grid
     $body = $grid.RectangleToScreen((New-Object Drawing.Rectangle(0, $grid.ColumnHeadersHeight, $grid.ClientSize.Width, [Math]::Max(0, $grid.ClientSize.Height - $grid.ColumnHeadersHeight))))
     $body = [Drawing.Rectangle]::Intersect($body, $visible)
@@ -281,6 +283,20 @@ $timer.Add_Tick({
 }.GetNewClosure())
 
 $result = $null
+# GetNewClosure creates a dynamic module whose unqualified function lookup can
+# reach global scope. Install a process-local save stub there and restore it.
+$priorGlobalSave = Get-Item -LiteralPath 'Function:\global:Save-ActSignerSettings' -ErrorAction SilentlyContinue
+$priorGlobalSaveBlock = $null
+if ($null -ne $priorGlobalSave) { $priorGlobalSaveBlock = $priorGlobalSave.ScriptBlock }
+$preferenceCalls = New-Object 'System.Collections.Generic.List[object]'
+$saveStub = {
+    param([string]$SourceRoot, [string]$SeparateOutputRoot, [bool]$SaveBesideSources)
+    $preferenceCalls.Add([pscustomobject]@{
+        SourceRoot = $SourceRoot; SeparateOutputRoot = $SeparateOutputRoot; SaveBesideSources = $SaveBesideSources
+    })
+    return $true
+}.GetNewClosure()
+Set-Item -LiteralPath 'Function:\global:Save-ActSignerSettings' -Value $saveStub
 try {
     $timer.Start()
     $result = Show-ActSignerWindow -CertificateProvider $certificateProvider -PlanProvider $planProvider
@@ -295,6 +311,10 @@ try {
         & $assert ([bool]$result.CopyOriginals) 'Separate-output choice must remain in the returned plan.'
         & $assert ($result.Plan.OutputRoot -eq 'C:\SyntheticPreviousOutput') 'The returned plan must retain the restored separate-output path.'
     }
+    & $assert ($preferenceCalls.Count -gt 0) 'The process-local preference save stub must receive the synthetic mode changes.'
+    $besideSaves = @($preferenceCalls | Where-Object { $_.SaveBesideSources -and $_.SourceRoot -eq 'C:\SyntheticActs' -and $_.SeparateOutputRoot -eq 'C:\SyntheticPreviousOutput' })
+    $separateSaves = @($preferenceCalls | Where-Object { -not $_.SaveBesideSources -and $_.SourceRoot -eq 'C:\SyntheticActs' -and $_.SeparateOutputRoot -eq 'C:\SyntheticPreviousOutput' })
+    & $assert ($besideSaves.Count -gt 0 -and $separateSaves.Count -gt 0) 'Synthetic preference saves must retain the prior output path in both modes.'
     # Exercise diagnostic failure only after completing the selected-plan assertions.
     $state.Phase = 10; $state.Form = $null; $state.Error = $null; $state.Started = [datetime]::UtcNow
     $failedCertificateProvider = { throw $syntheticReadError }.GetNewClosure()
@@ -307,7 +327,9 @@ try {
 catch { $failures.Add($_.Exception.Message) }
 finally {
     $timer.Stop(); $timer.Dispose()
-    $report = [pscustomobject]@{ NativeWindows = $true; PowerShellVersion = $PSVersionTable.PSVersion.ToString(); Measurements = @($measurements.ToArray()); Failures = @($failures.ToArray()) }
+    if ($null -ne $priorGlobalSaveBlock) { Set-Item -LiteralPath 'Function:\global:Save-ActSignerSettings' -Value $priorGlobalSaveBlock }
+    else { Remove-Item -LiteralPath 'Function:\global:Save-ActSignerSettings' -ErrorAction SilentlyContinue }
+    $report = [pscustomobject]@{ NativeWindows = $true; PowerShellVersion = $PSVersionTable.PSVersion.ToString(); Measurements = @($measurements.ToArray()); SyntheticPreferenceSaveCalls = @($preferenceCalls.ToArray()); Failures = @($failures.ToArray()) }
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'measurements.json') -Encoding UTF8
     Remove-Module $module -Force
 }
