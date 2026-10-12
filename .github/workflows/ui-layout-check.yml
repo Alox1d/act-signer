@@ -1,0 +1,42 @@
+name: Native Windows UI check
+
+on:
+  push:
+    branches: [main, ui-layout-check]
+    paths:
+      - 'ActSigner.UI.psm1'
+      - 'ActSigner.UI.Tests.ps1'
+      - '.github/workflows/ui-layout-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ActSigner.UI.psm1'
+      - 'ActSigner.UI.Tests.ps1'
+      - '.github/workflows/ui-layout-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  winforms:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Checkout synthetic UI check
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Measure actual WinForms layout
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.UI.Tests.ps1 -ArtifactDirectory .\ui-test-artifacts
+      - name: Upload synthetic measurements and form images
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: synthetic-winforms-layout
+          path: |
+            ui-test-artifacts/measurements.json
+            ui-test-artifacts/1000x700.png
+            ui-test-artifacts/900x600.png
+          if-no-files-found: error
+          retention-days: 7
