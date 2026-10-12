@@ -20,7 +20,16 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'ActSigner.Console.psm1') -Force -DisableNameChecking
     $consoleState = Disable-ActConsoleQuickEdit
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
-    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.4' } catch { }
+    $displayVersion = '1.5.0'
+    try {
+        $versionPath = Join-Path $PSScriptRoot 'ActSigner.Version.json'
+        if ([IO.File]::Exists($versionPath) -and (New-Object IO.FileInfo($versionPath)).Length -le 4096) {
+            $versionInfo = ConvertFrom-Json ([IO.File]::ReadAllText($versionPath, [Text.Encoding]::UTF8))
+            if ($versionInfo.Version -is [string] -and $versionInfo.Version -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { $displayVersion = $versionInfo.Version }
+        }
+    }
+    catch { }
+    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро ' + $displayVersion } catch { }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()

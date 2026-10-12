@@ -98,7 +98,7 @@ $measure = {
         $intersection = [Drawing.Rectangle]::Intersect($body, $rowRect)
         if ($intersection.Height -eq $row.Height -and $intersection.Width -gt 0) { $fullRows++ }
     }
-    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -eq 'Найти акты' -or $_.Text -eq 'Выбрать все новые' -or $_.Text -eq 'Снять выбор' -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
+    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -eq 'Найти акты' -or $_.Text -eq 'Выбрать все доступные' -or $_.Text -eq 'Снять выбор' -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
     $buttonInfo = @($buttons | ForEach-Object { [pscustomobject]@{ Text = $_.Text; FullyVisible = [bool](& $fullyVisible $_); Enabled = $_.Enabled } })
     $measurements.Add([pscustomobject]@{
         Name = $Name; WindowWidth = $form.Width; WindowHeight = $form.Height
@@ -199,7 +199,7 @@ $timer.Add_Tick({
             $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
             $find.PerformClick()
             & $assert ($state.Grid.Rows.Count -eq 20) 'The injected plan must populate all 20 acts.'
-            & $assert ([string]$state.Grid.Rows[0].Cells[2].Value -eq 'Подписей рядом: 2') 'Neighboring signatures must be visible as pending inspection.'
+            & $assert ([string]$state.Grid.Rows[0].Cells[2].Value -eq 'Проверить подписи (2)') 'Neighboring signatures must be visible as pending inspection.'
             & $assert ([bool]$state.Grid.Rows[0].Cells[0].Value -and -not $state.Grid.Rows[0].Cells[0].ReadOnly) 'Unverified neighboring files must not be treated as already-signed acts in the preview.'
             & $assert ($state.Grid.Rows[0].Cells[2].ToolTipText.Contains('выбранным сертификатом')) 'Pending inspection tooltip must explain the selected-certificate duplicate rule.'
             $state.Phase = 1
@@ -251,7 +251,7 @@ $timer.Add_Tick({
                 if ($i -ge 16) { & $assert $grid.Rows[$i].Cells[0].ReadOnly 'Existing signature checkbox must be read-only.' }
             }
             $clear = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Снять выбор' })[0]
-            $select = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать все новые' })[0]
+            $select = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать все доступные' })[0]
             $clear.PerformClick()
             & $assert (-not $state.Form.AcceptButton.Enabled) 'Zero checked acts must disable the plan action.'
             & $assert (@($grid.Rows | Where-Object { [bool]$_.Cells[0].Value }).Count -eq 0) 'Clear must uncheck all rows.'
@@ -260,7 +260,7 @@ $timer.Add_Tick({
             $clear.PerformClick()
             $grid.Rows[2].Cells[0].Value = $true
             $grid.Rows[7].Cells[0].Value = $true
-            & $assert ($state.Form.AcceptButton.Text -eq 'Подписать 2 акта') 'Plan action must show the checkbox count.'
+            & $assert ($state.Form.AcceptButton.Text -eq 'Проверить и подписать (2)') 'Plan action must show the checkbox count.'
             # Show-ActSignerWindow only returns a plan. No signing/COM/PIN code is imported.
             $state.Phase = 3
             $timer.Stop()

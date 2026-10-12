@@ -110,7 +110,16 @@ function Show-ActSignerWindow {
     $form = New-Object System.Windows.Forms.Form
     $ui.Form = $form
     $form.SuspendLayout()
-    $form.Text = 'Подписание актов 1.4'
+    $displayVersion = '1.5.0'
+    try {
+        $versionPath = Join-Path $PSScriptRoot 'ActSigner.Version.json'
+        if ([IO.File]::Exists($versionPath) -and (New-Object IO.FileInfo($versionPath)).Length -le 4096) {
+            $versionInfo = ConvertFrom-Json ([IO.File]::ReadAllText($versionPath, [Text.Encoding]::UTF8))
+            if ($versionInfo.Version -is [string] -and $versionInfo.Version -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { $displayVersion = $versionInfo.Version }
+        }
+    }
+    catch { }
+    $form.Text = 'Подписание актов ' + $displayVersion
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.Font = $baseFont
     $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
@@ -295,7 +304,7 @@ function Show-ActSignerWindow {
     $ui.Find = $find
     $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
     $find.TabIndex = 0
-    $selectNew = & $makeButton 'Выбрать все новые' 155 30
+    $selectNew = & $makeButton 'Выбрать все доступные' 155 30
     $ui.SelectNew = $selectNew
     $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
     $selectNew.TabIndex = 1
@@ -383,7 +392,7 @@ function Show-ActSignerWindow {
     $summary.TextAlign = 'MiddleLeft'
     $summary.Text = 'Выберите папку и нажмите Найти акты.'
     $summary.AccessibleName = 'Итоги поиска и выбора актов'
-    $sign = & $makeButton 'Подписать' 210 34
+    $sign = & $makeButton 'Проверить и подписать' 210 34
     $ui.Sign = $sign
     $sign.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
     $sign.Dock = 'Fill'
@@ -408,21 +417,9 @@ function Show-ActSignerWindow {
     $toolTip.SetToolTip($beside, 'Каждая новая .my.sig сохраняется в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.')
     $toolTip.SetToolTip($find, 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.')
     $toolTip.SetToolTip($details, 'Полные данные выбранного сертификата и сообщения диагностики.')
-    $sign.AccessibleDescription = 'После нажатия окно закроется, подписание продолжится в консоли. КриптоПро может запросить PIN носителя.'
+    $sign.AccessibleDescription = 'Сначала проверим соседние подписи. Уже подписанные выбранным сертификатом акты будут пропущены. Для остальных создадим новую подпись. Обработка продолжится в консоли; КриптоПро может запросить PIN носителя.'
     $toolTip.SetToolTip($sign, $sign.AccessibleDescription)
 
-    $actWord = {
-        param([int]$Count)
-        $lastTwo = $Count % 100
-        if ($lastTwo -ge 11 -and $lastTwo -le 14) { return 'актов' }
-        switch ($Count % 10) {
-            1 { return 'акт' }
-            2 { return 'акта' }
-            3 { return 'акта' }
-            4 { return 'акта' }
-            default { return 'актов' }
-        }
-    }
     $formatDate = {
         param($Value, [switch]$WithTime)
         try {
@@ -479,7 +476,7 @@ function Show-ActSignerWindow {
         }
         $certificateIndex = $ui.Certificate.SelectedIndex
         $hasCertificate = $certificateIndex -ge 0 -and $certificateIndex -lt $state.Certificates.Count
-        $ui.Sign.Text = 'Подписать {0} {1}' -f $selectedCount, (& $actWord $selectedCount)
+        $ui.Sign.Text = 'Проверить и подписать ({0})' -f $selectedCount
         $ui.Sign.Enabled = (-not $state.Busy) -and $null -ne $state.Plan -and $selectedCount -gt 0 -and $hasCertificate
         $ui.Find.Enabled = (-not $state.Busy) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Source.Text)) -and
@@ -496,7 +493,7 @@ function Show-ActSignerWindow {
         $ui.OutputBrowse.Enabled = $ui.Output.Enabled
         $ui.Grid.Enabled = -not $state.Busy
         if ($null -ne $state.Plan) {
-            $text = 'Найдено: {0}   |   Выбрано: {1}   |   Подпись уже есть: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
+            $text = 'Найдено: {0}   |   Выбрано: {1}   |   Есть .my.sig: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
             $skippedCount = @($state.Plan.SkippedReparsePoints).Count
             if ($skippedCount -gt 0) { $text += '   |   Пропущено ссылок: ' + $skippedCount }
             if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие акты в этой папке и её подпапках не найдены.' }
@@ -749,11 +746,11 @@ function Show-ActSignerWindow {
                 foreach ($item in @($plan.Items)) {
                     if ($null -eq $item) { continue }
                     $existing = [bool]$item.ExistingSignature
-                    $status = 'Новая подпись'
+                    $status = 'Подписей рядом нет'
                     $neighborCount = 0
                     if ($null -ne $item.PSObject.Properties['NeighborSignatureCount']) { $neighborCount = [int]$item.NeighborSignatureCount }
-                    if ($neighborCount -gt 0) { $status = 'Подписей рядом: ' + $neighborCount }
-                    if ($existing) { $status = 'Подпись уже есть' }
+                    if ($neighborCount -gt 0) { $status = 'Проверить подписи (' + $neighborCount + ')'  }
+                    if ($existing) { $status = 'Есть .my.sig' }
                     $rowIndex = $ui.Grid.Rows.Add([object[]]@((-not $existing), [string]$item.RelativePath, $status))
                     $row = $ui.Grid.Rows[$rowIndex]
                     $row.Tag = $item
@@ -761,7 +758,7 @@ function Show-ActSignerWindow {
                     $row.Cells[1].ToolTipText = 'Исходный PDF: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
                     $row.Cells[2].ToolTipText = [string]$item.SignaturePath
                     if (-not $existing -and $neighborCount -gt 0) {
-                        $row.Cells[2].ToolTipText = 'Перед подписанием проверим соседние файлы. Если этот PDF уже подписан выбранным сертификатом, повторной подписи не будет.'
+                        $row.Cells[2].ToolTipText = 'Соседние подписи найдены, но ещё не проверены. Галочка включает акт в проверку. Если КриптоПро подтвердит подпись этого PDF выбранным сертификатом, повторной подписи не будет.'
                     }
                     if ($existing) {
                         $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText

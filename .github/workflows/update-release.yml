@@ -1,0 +1,147 @@
+name: Native Windows update check and release
+
+on:
+  push:
+    branches: [main, ui-layout-check]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actsigner-update-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Verify native PowerShell 5.1 and release contracts
+    runs-on: windows-2022
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact checkout and native runtime
+        shell: powershell
+        run: |
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout differs from the workflow source SHA.' }
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Native Windows PowerShell 5.1 is required.' }
+      - name: Reproduce native unguarded baseline
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.Console.Tests.ps1 -Baseline -ArtifactDirectory .\console-test-artifacts\baseline
+          $baselineExit = $LASTEXITCODE
+          $report = Get-Content .\console-test-artifacts\baseline\native.json -Raw | ConvertFrom-Json
+          if ($baselineExit -ne 1 -or $report.Failures.Count -ne 1 -or $report.Failures[0] -notlike 'QuickEdit remains enabled:*' -or ($report.NativeModes.AfterDisable -band 0x40) -eq 0) {
+            throw 'Baseline must fail specifically because the native QuickEdit flag remains enabled.'
+          }
+          Write-Host 'RED confirmed: native QuickEdit remains enabled without the guard.'
+          exit 0
+      - name: Verify guarded native console behavior
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.Console.Tests.ps1 -ArtifactDirectory .\console-test-artifacts\guarded
+      - name: Verify neighboring signature file rules
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Core.Tests.ps1
+      - name: Verify CMS parsing and CScript bridge contracts
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.CryptoPro.Tests.ps1
+      - name: Verify settings preservation
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Settings.Tests.ps1
+      - name: Verify actual entry point with synthetic providers
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\Sign-Acts.Tests.ps1
+      - name: Measure actual WinForms layout
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.UI.Tests.ps1 -ArtifactDirectory .\ui-test-artifacts
+      - name: Verify updater filesystem transactions and rejection cases
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Update.Tests.ps1
+      - name: Verify native launcher subprocess and snapshot behavior
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\Start-ActSigner.Tests.ps1
+      - name: Verify allowlist package and draft publication contracts
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Build-Release.Tests.ps1
+      - name: Build actual source package after native gates
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Build-Release.ps1 -OutputDirectory .\release-check -SourceCommit "$env:GITHUB_SHA"
+      - name: Upload only synthetic verification reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: synthetic-update-verification
+          path: |
+            console-test-artifacts/baseline/native.json
+            console-test-artifacts/guarded/native.json
+            console-test-artifacts/guarded/detached.json
+            entry-test-artifacts/entry-measurements.json
+            update-test-artifacts/launcher-measurements.json
+            ui-test-artifacts/measurements.json
+            ui-test-artifacts/1000x700.png
+            ui-test-artifacts/900x600.png
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish tested update assets
+    needs: test
+    if: github.repository == 'Alox1d/act-signer' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout identical verified source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact tested source SHA
+        shell: powershell
+        run: |
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Publication checkout differs from tested source.' }
+      - name: Build explicit runtime payload
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Build-Release.ps1 -OutputDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
+      - name: Create draft, upload and verify both assets, then publish stable latest
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+          GH_NO_UPDATE_NOTIFIER: '1'
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Publish-Release.ps1 -AssetDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
+      - name: Verify anonymous download through the production updater
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedVersion = (Get-Content .\ActSigner.Version.json -Raw | ConvertFrom-Json).Version
+          Import-Module .\ActSigner.Update.psm1 -Force -DisableNameChecking
+          $probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('ActSigner-public-update-' + [guid]::NewGuid().ToString('N'))
+          $bundledRoot = Join-Path $probeRoot 'bundled'
+          [void][IO.Directory]::CreateDirectory($bundledRoot)
+          try {
+            # A synthetic older bundle forces real public HTTP downloads. No downloaded code is executed.
+            [IO.File]::WriteAllText((Join-Path $bundledRoot 'ActSigner.Version.json'), '{"SchemaVersion":1,"Version":"0.0.0","LauncherProtocol":1}', (New-Object Text.UTF8Encoding($true)))
+            foreach ($attempt in 1..2) {
+              # Allow a brief delay between publication and anonymous API/CDN visibility.
+              $stateRoot = Join-Path $probeRoot ('updates-' + $attempt)
+              $result = Invoke-ActUpdateCheck -ApplicationRoot $bundledRoot -StateRoot $stateRoot
+              if ($result.Status -ceq 'updated' -and $result.Version -ceq $expectedVersion) { break }
+              if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
+            }
+            if ($result.Status -cne 'updated' -or $result.Version -cne $expectedVersion) { throw ('Public update download did not prepare the published version: ' + $result.Status) }
+            $selection = Get-ActLaunchSelection -BundledRoot $bundledRoot -StateRoot $stateRoot
+            if (-not $selection.UsingCached -or $selection.Version -cne $expectedVersion) { throw 'The published package is not selectable on the next launch.' }
+            $manifest = Get-Content (Join-Path $selection.ApplicationRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
+            if ($manifest.SourceCommit -cne $env:GITHUB_SHA) { throw 'The public update differs from the tested source commit.' }
+            Write-Host ('PASS: anonymous GitHub download, verified full payload and next-launch selection for ' + $expectedVersion)
+          } finally {
+            if ([IO.Directory]::Exists($probeRoot)) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
+          }

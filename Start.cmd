@@ -7,7 +7,7 @@ if not exist "%ACTSIGNER_PS%" (
   pause
   exit /b 1
 )
-"%ACTSIGNER_PS%" -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0Sign-Acts.ps1"
+"%ACTSIGNER_PS%" -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0Start-ActSigner.ps1"
 set "ACTSIGNER_EXIT=%ERRORLEVEL%"
 echo.
 pause
