@@ -25,6 +25,35 @@ try {
         [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($file))
         [IO.File]::WriteAllText($file, 'SYNTHETIC PRIVATE SENTINEL')
     }
+    # Exercise the actual -File interface, with no SourceRoot and an unrelated CWD.
+    # Windows explicitly selects Windows PowerShell 5.1, never a pwsh substitute.
+    $fixtureTools = Join-Path $source 'tools'
+    [void][IO.Directory]::CreateDirectory($fixtureTools)
+    $fixtureBuilder = Join-Path $fixtureTools 'Build-Release.ps1'
+    [IO.File]::Copy($builder, $fixtureBuilder)
+    $defaultOutput = Join-Path $testRoot 'default-source-release'
+    $nativeHost = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    } else { Join-Path $PSHOME 'pwsh' }
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $nativeHost
+    $start.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $fixtureBuilder + '" -OutputDirectory "' + $defaultOutput + '" -SourceCommit ' + $commit
+    $start.WorkingDirectory = $testRoot
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        [void]$process.Start()
+        if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'Default-SourceRoot native package process exceeded 30 seconds.' }
+        $nativeOutput = $process.StandardOutput.ReadToEnd() + $process.StandardError.ReadToEnd()
+        Assert-Package ($process.ExitCode -eq 0) ('Default-SourceRoot -File build must succeed from an unrelated working directory. Synthetic child output: ' + $nativeOutput)
+    } finally { $process.Dispose() }
+    $defaultManifest = [IO.File]::ReadAllText((Join-Path $defaultOutput 'ActSigner-update.json')) | ConvertFrom-Json
+    Assert-Package ($defaultManifest.Version -ceq '1.5.0' -and $defaultManifest.SourceCommit -ceq $commit) 'Default source must resolve to the copied builder parent application, not CWD.'
+    Assert-Package ((@($defaultManifest.Files.Path | Sort-Object) -join ',') -ceq (@($expected | Sort-Object) -join ',')) 'Default-SourceRoot subprocess must package exactly the runtime allowlist.'
+    Assert-Package ($defaultManifest.Sha256 -ceq (Get-FileHash -LiteralPath (Join-Path $defaultOutput 'ActSigner-1.5.0.zip') -Algorithm SHA256).Hash.ToLowerInvariant()) 'Default-SourceRoot subprocess archive must match its manifest.'
     $output = Join-Path $testRoot 'release'
     $result = & $builder -SourceRoot $source -OutputDirectory $output -SourceCommit $commit
     Assert-Package ($result.Version -ceq '1.5.0') 'Builder must report the validated version.'
@@ -126,6 +155,6 @@ try {
     $rejected = $false
     try { & $builder -SourceRoot $source -OutputDirectory (Join-Path $testRoot 'missing') -SourceCommit $commit | Out-Null } catch { $rejected = $true }
     Assert-Package $rejected 'Incomplete runtime payload must be rejected.'
-    Write-Host 'Build-Release tests passed: real allowlist ZIP, manifest/file hashes, private-file exclusion, immutable assets and version/missing-file rejection.'
+    Write-Host 'Build-Release tests passed: default-SourceRoot subprocess from unrelated CWD, real allowlist ZIP, manifest/file hashes, private-file exclusion, immutable assets and version/missing-file rejection.'
     Write-Host 'Publish-Release tests passed: draft/full-pair/readback/stable publication, published-version refusal, same-commit recovery, mismatched commit/tag refusal, interrupted upload/readback and main-only gating.'
 } finally { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force } }

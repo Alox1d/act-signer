@@ -1,12 +1,14 @@
 ﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$SourceRoot,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$SourceCommit
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+# Windows PowerShell 5.1 -File does not reliably initialize PSScriptRoot during parameter defaults.
+if (-not $PSBoundParameters.ContainsKey('SourceRoot')) { $SourceRoot = Split-Path -Parent $PSScriptRoot }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 # Intentional literal allowlist: do not replace with a directory or glob scan.

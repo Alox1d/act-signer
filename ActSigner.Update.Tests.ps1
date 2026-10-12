@@ -52,6 +52,7 @@ function Invoke-FixtureUpdate { param($Fixture,[string]$ApplicationRoot,[string]
 }
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('ActSigner Update Кириллица [1] & (2) ' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($testRoot)
+$external=$null
 try {
     $bundled = Join-Path $testRoot 'bundled'
     Write-UpdateFixture (Join-Path $bundled 'ActSigner.Version.json') '{"SchemaVersion":1,"Version":"1.5.0","LauncherProtocol":1}'
@@ -190,7 +191,10 @@ try {
     Assert-Update (-not $escapedPointer.UsingCached) 'Escaping cached pointer was accepted.'
     Write-Host 'PASS: orphaned complete-version recovery and cached manifest/pointer tamper fallback'
     # A redirected state root must be rejected before creating any external updater files.
-    $external=Join-Path $testRoot 'external'
+    # Windows PowerShell 5.1 treats brackets in New-Item -Target as wildcards.
+    # Keep the linked state path under the special-character root, but give its
+    # independently owned target a plain unique name outside that root.
+    $external=Join-Path ([IO.Path]::GetTempPath()) ('ActSigner-update-external-' + [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($external)
     Write-UpdateFixture (Join-Path $external 'keep.txt') 'external bytes'
     $linkedState=Join-Path $testRoot 'linked-state'
@@ -200,7 +204,10 @@ try {
         else { $null=New-Item -ItemType SymbolicLink -Path $linkedState -Target $external -ErrorAction Stop }
         $createdLink=$true
     }
-    catch { Write-Host ('SKIP state reparse fixture: '+$_.Exception.Message) }
+    catch {
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { throw }
+        Write-Host ('SKIP state reparse fixture: '+$_.Exception.Message)
+    }
     if ($createdLink) {
         try {
             $redirected=Invoke-FixtureUpdate $fixture $bundled $linkedState
@@ -257,4 +264,7 @@ try {
  
 
 }
-finally { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force } }
+finally {
+    try { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force } }
+    finally { if ($null -ne $external -and [IO.Directory]::Exists($external)) { Remove-Item -LiteralPath $external -Recurse -Force } }
+}

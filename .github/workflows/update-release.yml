@@ -117,3 +117,31 @@ jobs:
           GH_PROMPT_DISABLED: '1'
           GH_NO_UPDATE_NOTIFIER: '1'
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Publish-Release.ps1 -AssetDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
+      - name: Verify anonymous download through the production updater
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedVersion = (Get-Content .\ActSigner.Version.json -Raw | ConvertFrom-Json).Version
+          Import-Module .\ActSigner.Update.psm1 -Force -DisableNameChecking
+          $probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('ActSigner-public-update-' + [guid]::NewGuid().ToString('N'))
+          $bundledRoot = Join-Path $probeRoot 'bundled'
+          [void][IO.Directory]::CreateDirectory($bundledRoot)
+          try {
+            # A synthetic older bundle forces real public HTTP downloads. No downloaded code is executed.
+            [IO.File]::WriteAllText((Join-Path $bundledRoot 'ActSigner.Version.json'), '{"SchemaVersion":1,"Version":"0.0.0","LauncherProtocol":1}', (New-Object Text.UTF8Encoding($true)))
+            foreach ($attempt in 1..2) {
+              # Allow a brief delay between publication and anonymous API/CDN visibility.
+              $stateRoot = Join-Path $probeRoot ('updates-' + $attempt)
+              $result = Invoke-ActUpdateCheck -ApplicationRoot $bundledRoot -StateRoot $stateRoot
+              if ($result.Status -ceq 'updated' -and $result.Version -ceq $expectedVersion) { break }
+              if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
+            }
+            if ($result.Status -cne 'updated' -or $result.Version -cne $expectedVersion) { throw ('Public update download did not prepare the published version: ' + $result.Status) }
+            $selection = Get-ActLaunchSelection -BundledRoot $bundledRoot -StateRoot $stateRoot
+            if (-not $selection.UsingCached -or $selection.Version -cne $expectedVersion) { throw 'The published package is not selectable on the next launch.' }
+            $manifest = Get-Content (Join-Path $selection.ApplicationRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
+            if ($manifest.SourceCommit -cne $env:GITHUB_SHA) { throw 'The public update differs from the tested source commit.' }
+            Write-Host ('PASS: anonymous GitHub download, verified full payload and next-launch selection for ' + $expectedVersion)
+          } finally {
+            if ([IO.Directory]::Exists($probeRoot)) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
+          }
