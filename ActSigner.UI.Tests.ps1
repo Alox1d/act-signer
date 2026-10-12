@@ -31,6 +31,7 @@ $items = @(for ($i = 0; $i -lt 20; $i++) {
         RelativePath = $relative; SourcePath = 'C:\SyntheticActs\' + $relative
         SignaturePath = 'C:\SyntheticOutput\' + $relative + '.my.sig'
         DocumentOutputPath = 'C:\SyntheticOutput\' + $relative; ExistingSignature = ($i -ge 16)
+        NeighborSignatureCount = $(if ($i -lt 4) { 2 } else { 0 })
     }
 })
 $fixturePlan = [pscustomobject]@{
@@ -198,6 +199,9 @@ $timer.Add_Tick({
             $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
             $find.PerformClick()
             & $assert ($state.Grid.Rows.Count -eq 20) 'The injected plan must populate all 20 acts.'
+            & $assert ([string]$state.Grid.Rows[0].Cells[2].Value -eq 'Подписей рядом: 2') 'Neighboring signatures must be visible as pending inspection.'
+            & $assert ([bool]$state.Grid.Rows[0].Cells[0].Value -and -not $state.Grid.Rows[0].Cells[0].ReadOnly) 'Unverified neighboring files must not be treated as already-signed acts in the preview.'
+            & $assert ($state.Grid.Rows[0].Cells[2].ToolTipText.Contains('выбранным сертификатом')) 'Pending inspection tooltip must explain the selected-certificate duplicate rule.'
             $state.Phase = 1
             return
         }

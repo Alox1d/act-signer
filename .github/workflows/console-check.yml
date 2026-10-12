@@ -1,0 +1,77 @@
+name: Native Windows signing checks
+
+on:
+  push:
+    branches: [main, ui-layout-check]
+    paths:
+      - 'Sign-Acts.ps1'
+      - 'Sign-Acts.Tests.ps1'
+      - 'ActSigner.Console.psm1'
+      - 'ActSigner.Console.Tests.ps1'
+      - 'ActSigner.Core.psm1'
+      - 'ActSigner.Core.Tests.ps1'
+      - 'ActSigner.CryptoPro.psm1'
+      - 'ActSigner.CryptoPro.js'
+      - 'ActSigner.CryptoPro.Tests.ps1'
+      - '.github/workflows/console-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Sign-Acts.ps1'
+      - 'Sign-Acts.Tests.ps1'
+      - 'ActSigner.Console.psm1'
+      - 'ActSigner.Console.Tests.ps1'
+      - 'ActSigner.Core.psm1'
+      - 'ActSigner.Core.Tests.ps1'
+      - 'ActSigner.CryptoPro.psm1'
+      - 'ActSigner.CryptoPro.js'
+      - 'ActSigner.CryptoPro.Tests.ps1'
+      - '.github/workflows/console-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  console:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Checkout synthetic console check
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Reproduce native unguarded baseline
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.Console.Tests.ps1 -Baseline -ArtifactDirectory .\console-test-artifacts\baseline
+          $baselineExit = $LASTEXITCODE
+          $report = Get-Content .\console-test-artifacts\baseline\native.json -Raw | ConvertFrom-Json
+          if ($baselineExit -ne 1 -or $report.Failures.Count -ne 1 -or $report.Failures[0] -notlike 'QuickEdit remains enabled:*' -or ($report.NativeModes.AfterDisable -band 0x40) -eq 0) {
+            throw 'Baseline must fail specifically because the native QuickEdit flag remains enabled.'
+          }
+          Write-Host 'RED confirmed: real native console still has QuickEdit enabled without the guard.'
+          exit 0
+      - name: Verify guarded native console behavior
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.Console.Tests.ps1 -ArtifactDirectory .\console-test-artifacts\guarded
+      - name: Verify neighboring-signature file rules
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Core.Tests.ps1
+      - name: Verify CMS parsing and CScript bridge contracts
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.CryptoPro.Tests.ps1
+      - name: Verify actual entry point with synthetic providers
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\Sign-Acts.Tests.ps1
+      - name: Upload synthetic native mode reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: synthetic-console-modes
+          path: |
+            console-test-artifacts/baseline/native.json
+            console-test-artifacts/guarded/native.json
+            console-test-artifacts/guarded/detached.json
+            entry-test-artifacts/entry-measurements.json
+          if-no-files-found: error
+          retention-days: 7

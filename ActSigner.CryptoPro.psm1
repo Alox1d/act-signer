@@ -105,8 +105,8 @@ namespace ActSigner {
                 await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
             }
             if (command == "VERIFY") await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
-            if (command == "SIGN" || command == "VERIFY") await WriteBlobAsync(pdf).ConfigureAwait(false);
-            if (command == "VERIFY") await WriteBlobAsync(signature).ConfigureAwait(false);
+            if (command == "SIGN" || command == "VERIFY" || command == "INSPECT") await WriteBlobAsync(pdf).ConfigureAwait(false);
+            if (command == "VERIFY" || command == "INSPECT") await WriteBlobAsync(signature).ConfigureAwait(false);
             await input.WriteLineAsync("END").ConfigureAwait(false);
             await input.FlushAsync().ConfigureAwait(false);
         }
@@ -268,12 +268,14 @@ function Invoke-ActBridgeExchange {
     $maximum = 24MB
     if ($Command -eq 'SIGN') { $maximum = 90MB }
     if ($Command -in @('CHECK', 'VERIFY')) { $maximum = 4096 }
+    if ($Command -eq 'INSPECT') { $maximum = 192KB }
     try {
         $reply = $Transport.Exchange($Command, $Kind, $Thumbprint, $PdfBytes, $SignatureBytes, $Timeout, $maximum)
     } catch {
         $error = $_.Exception
         while ($null -ne $error.InnerException) { $error = $error.InnerException }
         if ($error -is [TimeoutException]) {
+            if ($Command -eq 'INSPECT') { throw 'Проверка соседней подписи превысила 60 секунд. Процесс проверки остановлен; документ не считается проверенным.' }
             throw ('Истекло время ожидания КриптоПро ({0} с). Операция остановлена, сеанс закрыт. Начните подписание заново после проверки окна PIN или сертификата.' -f [int]($Timeout / 1000))
         }
         throw 'Windows Script Host (CScript) завершился без корректного ответа. Он может быть недоступен или запрещён политикой Windows; проверьте установленный комплект программы и КриптоПро.'
@@ -481,6 +483,109 @@ function Test-ActCryptoSignature {
     if ($payload.Length -ne 2 -or $payload[0] -cne '1' -or $payload[1] -cne $expected) { throw 'Проверка подписи не подтвердила единственного выбранного подписанта.' }
 }
 
+function ConvertTo-ActExistingSignatureDer {
+    param([byte[]]$SignatureBytes)
+    # Common detached-signature encodings only. No paths and no content rewriting.
+    if ($SignatureBytes.Length -le 0 -or $SignatureBytes.Length -gt $script:ActBridgeMaxBytes) {
+        throw [FormatException]::new('Размер соседней подписи должен быть от 1 байта до 64 МиБ.')
+    }
+    if ($SignatureBytes[0] -eq 0x30) { return ,$SignatureBytes }
+    try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($SignatureBytes) } catch {
+        throw [FormatException]::new('Не удалось распознать соседнюю подпись как DER, Base64 или PEM CMS/PKCS7.')
+    }
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xfeff) { $text = $text.Substring(1) }
+    $text = $text.Trim([char[]]" `t`r`n")
+    if ($text.StartsWith('-----BEGIN ')) {
+        if ($text -cnotmatch '\A-----BEGIN (PKCS7|CMS)-----[ \t\r\n]*(?<body>[A-Za-z0-9+/= \t\r\n]+)-----END \1-----\z') {
+            throw [FormatException]::new('Некорректный PEM: ожидается один полный блок CMS или PKCS7.')
+        }
+        $text = $Matches['body']
+    }
+    $base64 = $text -replace '[ \t\r\n]', ''
+    if ($base64 -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z' -or $base64.Length % 4 -ne 0) {
+        throw [FormatException]::new('Некорректное кодирование соседней подписи в Base64.')
+    }
+    try { [byte[]]$raw = [Convert]::FromBase64String($base64) } catch {
+        throw [FormatException]::new('Не удалось разобрать соседнюю подпись в Base64.')
+    }
+    if ($raw.Length -le 0 -or $raw.Length -gt $script:ActBridgeMaxBytes -or $raw[0] -ne 0x30 -or [Convert]::ToBase64String($raw) -cne $base64) {
+        throw [FormatException]::new('Соседняя подпись не содержит корректно закодированное сообщение CMS/PKCS7.')
+    }
+    return ,$raw
+}
+
+function Initialize-ActCmsDecoder {
+    if ('System.Security.Cryptography.Pkcs.SignedCms' -as [type]) { return }
+    try {
+        if ($PSVersionTable.PSEdition -eq 'Desktop') { Add-Type -AssemblyName System.Security -ErrorAction Stop }
+        else { Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction Stop }
+    } catch { throw 'Не удалось загрузить системный модуль .NET для чтения CMS/PKCS7. Проверка соседних подписей остановлена.' }
+}
+
+function Assert-ActDetachedCmsEnvelope {
+    param([byte[]]$SignatureBytes)
+    # Decode only. Neither certificate identity nor validity comes from this parser.
+    # SignedCms.Detached reflects its constructor, not the decoded envelope.
+    Initialize-ActCmsDecoder
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
+    try { $cms.Decode($SignatureBytes) } catch {
+        throw [FormatException]::new('Соседний файл не удалось разобрать как подписанное сообщение CMS/PKCS7.')
+    }
+    if ($cms.ContentInfo.ContentType.Value -cne '1.2.840.113549.1.7.1') {
+        throw [FormatException]::new('В соседней подписи обнаружен неподдерживаемый тип вложенного содержимого.')
+    }
+    if ($cms.ContentInfo.Content.Length -ne 0) {
+        throw [FormatException]::new('Соседняя подпись содержит вложенный документ. Автоматическая проверка поддерживает отделённые подписи; проверьте этот файл вручную.')
+    }
+    if ($cms.SignerInfos.Count -lt 1 -or $cms.SignerInfos.Count -gt 4096) {
+        throw [FormatException]::new('В соседней подписи отсутствуют подписанты или превышен допустимый предел 4096 подписантов.')
+    }
+}
+
+function Get-ActExistingSignatureInfo {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$PdfBytes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$SignatureBytes
+    )
+    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер проверяемого PDF должен быть от 1 байта до 64 МиБ.' }
+    try {
+        [byte[]]$signature = ConvertTo-ActExistingSignatureDer $SignatureBytes
+        Assert-ActDetachedCmsEnvelope $signature
+    } catch [FormatException] {
+        return [pscustomobject]@{ Status = 'unverifiable'; Thumbprints = [string[]]@(); Message = $_.Exception.Message }
+    }
+    # A fresh read-only worker; no SELECT/SIGN, certificate store, token or PIN.
+    # Transport/timeout/protocol failures deliberately throw, never mean "absent".
+    $payload = Invoke-ActBridgeOnce 'INSPECT' 0 '' $PdfBytes $signature 60000
+    $index = 0
+    $status = Read-ActBridgeField $payload ([ref]$index)
+    if ($status -cnotmatch '^(valid|different_content|unverifiable)$') { throw 'Неизвестный результат проверки соседней подписи.' }
+    $count = Read-ActBridgeNumber $payload ([ref]$index) 4096
+    $thumbprints = New-Object 'System.Collections.Generic.List[string]'
+    if ($status -ceq 'valid') {
+        if ($count -lt 1) { throw 'КриптоПро не подтвердил ни одного подписанта соседней подписи.' }
+        for ($i = 0; $i -lt $count; $i++) {
+            $thumbprint = Read-ActBridgeField $payload ([ref]$index)
+            if ($thumbprint -cnotmatch '^[0-9A-F]{40}$') { throw 'КриптоПро вернул некорректный отпечаток подписанта соседней подписи.' }
+            $thumbprints.Add($thumbprint)
+        }
+        $message = 'Подпись проверена для этого PDF.'
+    } else {
+        if ($count -ne 0) { throw 'Неподтверждённая соседняя подпись не должна содержать подтверждённых подписантов.' }
+        $stage = Read-ActBridgeField $payload ([ref]$index)
+        $code = Read-ActBridgeField $payload ([ref]$index)
+        $hresult = Read-ActBridgeField $payload ([ref]$index)
+        if ($stage -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $code -cnotmatch '^[A-Z_]{1,32}$' -or $hresult -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректная диагностика проверки соседней подписи.' }
+        if ($status -ceq 'different_content') {
+            if ($stage -cne 'SignedData.VerifyCades' -or $code -cne 'NATIVE' -or $hresult -cne '0x80091007') { throw 'КриптоПро не подтвердил несовпадение содержимого соседней подписи.' }
+            $message = 'Содержимое соседней подписи не совпало с этим PDF.'
+        }
+        else { $message = ('Не удалось проверить соседнюю подпись. Этап {0}; код {1}; HRESULT {2}.' -f $stage, $code, $hresult) }
+    }
+    Assert-ActBridgeEnd $payload $index
+    return [pscustomobject]@{ Status = $status; Thumbprints = [string[]]$thumbprints.ToArray(); Message = $message }
+}
+
 function Close-ActCryptoSession {
     param([object]$Session)
     if ($null -eq $Session) { return }
@@ -493,4 +598,4 @@ function Close-ActCryptoSession {
     $Session.Store = $null
 }
 
-Export-ModuleMember -Function Test-ActCryptoPro, Get-ActCertificates, New-ActCryptoSession, Invoke-ActCryptoSign, Test-ActCryptoSignature, Close-ActCryptoSession
+Export-ModuleMember -Function Test-ActCryptoPro, Get-ActCertificates, New-ActCryptoSession, Invoke-ActCryptoSign, Test-ActCryptoSignature, Get-ActExistingSignatureInfo, Close-ActCryptoSession

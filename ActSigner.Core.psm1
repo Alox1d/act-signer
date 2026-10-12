@@ -78,6 +78,100 @@ function Test-ActWritableDirectory {
     }
 }
 
+function Test-ActSignatureExtension {
+    param([string]$Path)
+    return [IO.Path]::GetExtension($Path) -imatch '^\.(sig|p7s|p7m|sgn)$'
+}
+
+function Get-ActNeighborSignaturePaths {
+    param($Item)
+    $directories = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($path in @($Item.SourcePath, $Item.DocumentOutputPath)) {
+        $directory = [IO.Path]::GetDirectoryName((Get-ActFullPath $path))
+        if (@($directories | Where-Object { Test-ActSamePath $_ $directory }).Count -eq 0) { $directories.Add($directory) }
+    }
+    foreach ($directory in $directories) {
+        Assert-ActSafeExistingAncestors $directory
+        if (-not [IO.Directory]::Exists($directory)) { continue }
+        $info = New-Object IO.DirectoryInfo($directory)
+        # Include reparse candidates as unresolved; safe reads reject them without
+        # following their targets. No child directory is searched here.
+        foreach ($file in @($info.GetFiles() | Sort-Object -Property Name)) {
+            if (Test-ActSignatureExtension $file.Name) { $file.FullName }
+        }
+    }
+}
+
+function Get-ActNeighborSignatureCheck {
+    param($Item, $SourceState, [string]$Thumbprint, [scriptblock]$Inspector, [scriptblock]$OnProgress, [int]$Index, [int]$Total)
+    $paths = @(Get-ActNeighborSignaturePaths $Item)
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    $issues = New-Object 'System.Collections.Generic.List[string]'
+    $duplicatePath = ''
+    $candidateIndex = 0
+    foreach ($path in $paths) {
+        $candidateIndex++
+        Send-ActProgress $OnProgress $Index $Total $Item 'checking_existing' ('Проверяем соседнюю подпись {0}/{1}: {2}' -f $candidateIndex, $paths.Count, [IO.Path]::GetFileName($path))
+        $signatureState = $null
+        try {
+            if ($null -eq $Inspector) { throw 'Не задано средство проверки существующих подписей. Новая подпись не создаётся.' }
+            $signatureState = Open-ActReadState -Path $path
+            if ($signatureState.Bytes.Length -eq 0) { throw 'Файл подписи пуст.' }
+            $records.Add([pscustomobject]@{ Path = $path; Hash = $signatureState.Hash })
+            # The exact snapshot is inspected. Close its stream before invoking
+            # external code, then recheck its digest before private-key use.
+            $signatureState.Stream.Dispose()
+            $signatureState.Stream = $null
+            $answers = @(& $Inspector ([byte[]]$SourceState.Bytes) ([byte[]]$signatureState.Bytes))
+            if ($answers.Count -ne 1 -or $null -eq $answers[0] -or $null -eq $answers[0].PSObject.Properties['Status']) { throw 'Средство проверки вернуло некорректный результат.' }
+            $answer = $answers[0]
+            if ([string]$answer.Status -cnotin @('valid', 'different_content', 'unverifiable')) { throw 'Средство проверки вернуло неизвестный статус.' }
+            if ($answer.Status -ceq 'unverifiable') {
+                $message = 'Не удалось достоверно проверить подпись.'
+                if ($null -ne $answer.PSObject.Properties['Message'] -and -not [string]::IsNullOrWhiteSpace([string]$answer.Message)) { $message = [string]$answer.Message }
+                throw $message
+            }
+            if ($answer.Status -ceq 'valid') {
+                if ($null -eq $answer.PSObject.Properties['Thumbprints'] -or @($answer.Thumbprints).Count -eq 0) { throw 'Проверенная подпись не содержит данных подписантов.' }
+                $matchesSelected = $false
+                foreach ($signerThumb in @($answer.Thumbprints)) {
+                    $normalized = [regex]::Replace([string]$signerThumb, '\s', '').ToUpperInvariant()
+                    if ($normalized -cnotmatch '^[0-9A-F]{40}$') { throw 'Средство проверки вернуло некорректный отпечаток подписанта.' }
+                    if ($normalized -ceq $Thumbprint) { $matchesSelected = $true }
+                }
+                if ($matchesSelected) { $duplicatePath = $path; break }
+            }
+        }
+        catch { $issues.Add(([IO.Path]::GetFileName($path) + ': ' + $_.Exception.Message)) }
+        finally { if ($null -ne $signatureState -and $null -ne $signatureState.Stream) { $signatureState.Stream.Dispose() } }
+    }
+    # A confirmed selected-certificate duplicate ends further inspections, even
+    # after an unsupported candidate. Otherwise uncertainty must not become absence.
+    if ([string]::IsNullOrEmpty($duplicatePath) -and $issues.Count -gt 0) {
+        throw ('Нельзя безопасно создать новую подпись: ' + ($issues.ToArray() -join ' | '))
+    }
+    return [pscustomobject]@{ Paths = $paths; Records = $records; DuplicatePath = $duplicatePath }
+}
+
+function Assert-ActNeighborSignaturesUnchanged {
+    param($Item, $Check, [switch]$DuplicateOnly)
+    if (-not $DuplicateOnly) {
+        $currentPaths = @(Get-ActNeighborSignaturePaths $Item)
+        if ($currentPaths.Count -ne $Check.Paths.Count) { throw 'Набор соседних подписей изменился во время проверки. Повторите поиск и подписание.' }
+        foreach ($path in $currentPaths) {
+            if (@($Check.Paths | Where-Object { Test-ActSamePath $_ $path }).Count -ne 1) { throw 'Набор соседних подписей изменился во время проверки. Повторите поиск и подписание.' }
+        }
+    }
+    foreach ($record in $Check.Records) {
+        if ($DuplicateOnly -and -not (Test-ActSamePath $record.Path $Check.DuplicatePath)) { continue }
+        $snapshot = Open-ActReadState -Path $record.Path
+        try {
+            if ($snapshot.Hash -cne $record.Hash) { throw ('Соседняя подпись изменилась во время проверки: ' + [IO.Path]::GetFileName($record.Path)) }
+        }
+        finally { $snapshot.Stream.Dispose() }
+    }
+}
+
 function Get-ActPlan {
     [CmdletBinding()]
     param(
@@ -124,6 +218,7 @@ function Get-ActPlan {
                 SignaturePath = $signaturePath
                 DocumentOutputPath = $documentOutput
                 ExistingSignature = [System.IO.File]::Exists($signaturePath)
+                NeighborSignatureCount = @(Get-ActNeighborSignaturePaths ([pscustomobject]@{ SourcePath = $entry.FullName; DocumentOutputPath = $documentOutput })).Count
             })
         }
     }
@@ -311,6 +406,7 @@ function Invoke-ActBatch {
         [Parameter(Mandatory = $true)][scriptblock]$VerifyBlock,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [scriptblock]$OnProgress,
+        [scriptblock]$ExistingSignatureInspector,
         [switch]$CopyOriginals
     )
     $ErrorActionPreference = 'Stop'
@@ -318,6 +414,7 @@ function Invoke-ActBatch {
     $copy = [bool]$Plan.SeparateOutput
     if ($PSBoundParameters.ContainsKey('CopyOriginals')) { $copy = [bool]$CopyOriginals }
     $thumb = [regex]::Replace($Thumbprint, '\s', '').ToUpperInvariant()
+    if ($thumb -cnotmatch '^[0-9A-F]{40}$') { throw 'Некорректный отпечаток выбранного сертификата.' }
     $logDirectory = Get-ActFullPath $LogRoot
     New-ActSafeDirectory $logDirectory
     $logPath = [System.IO.Path]::Combine($logDirectory, 'act-sign-' + [datetime]::Now.ToString('yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.csv')
@@ -356,36 +453,64 @@ function Invoke-ActBatch {
                 $sourceState = Open-ActReadState -Path $item.SourcePath -RequirePdf
                 $states.Add($sourceState)
                 $hash = $sourceState.Hash
-                $signatureDirectory = [System.IO.Path]::GetDirectoryName($item.SignaturePath)
-                Test-ActWritableDirectory $signatureDirectory
-                Assert-ActSafeExistingAncestors $item.SignaturePath
-                if ([System.IO.File]::Exists($item.SignaturePath) -or [System.IO.Directory]::Exists($item.SignaturePath)) { throw ('Путь подписи уже занят: ' + $item.SignaturePath) }
-                if ($copy) {
-                    [void](Assert-ActCopyDestination -Path $item.DocumentOutputPath -ExpectedHash $sourceState.Hash)
-                    $copies.Add([pscustomobject]@{ State = $sourceState; DestinationPath = $item.DocumentOutputPath })
-                    foreach ($companion in @(Get-ActCompanions $item)) {
-                        $state = Open-ActReadState -Path $companion
-                        $states.Add($state)
-                        $destination = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($item.DocumentOutputPath), [System.IO.Path]::GetFileName($companion))
-                        [void](Assert-ActCopyDestination -Path $destination -ExpectedHash $state.Hash)
-                        $copies.Add([pscustomobject]@{ State = $state; DestinationPath = $destination })
-                    }
+                $stage = 'Проверка соседних подписей'
+                Send-ActProgress $OnProgress ($index + 1) $items.Count $item 'checking_existing' 'Проверяем существующие подписи рядом с актом.'
+                $neighborCheck = Get-ActNeighborSignatureCheck $item $sourceState $thumb $ExistingSignatureInspector $OnProgress ($index + 1) $items.Count
+                if (-not [string]::IsNullOrEmpty($neighborCheck.DuplicatePath)) {
+                    Assert-ActNeighborSignaturesUnchanged $item $neighborCheck -DuplicateOnly
+                    if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время проверки существующих подписей.' }
+                    $row = New-ActResultRow $item $hash $thumb 'already_signed' ('Акт уже подписан выбранным сертификатом. Проверенная соседняя подпись: ' + $neighborCheck.DuplicatePath + '. Новая подпись и копии не создавались.')
                 }
-                $stage = 'Подписание'
-                Send-ActProgress $OnProgress ($index + 1) $items.Count $item 'signing' 'Подписание исходного акта.'
-                [byte[]]$signatureBytes = & $SignBlock ([byte[]]$sourceState.Bytes)
-                if ($null -eq $signatureBytes -or $signatureBytes.Length -eq 0) { throw 'Средство подписи вернуло пустой результат.' }
-                if ($signatureBytes.Length -gt $script:ActMaxBytes) { throw 'Размер подписи превышает 64 МиБ.' }
-                $stage = 'Проверка подписи'
-                & $VerifyBlock ([byte[]]$sourceState.Bytes) $signatureBytes $thumb | Out-Null
-                $stage = 'Повторная проверка исходника'
-                if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время подписания. Подпись не сохранена.' }
-                $stage = 'Сохранение комплекта'
-                foreach ($copyItem in $copies) { [void](Copy-ActStateNoOverwrite -State $copyItem.State -DestinationPath $copyItem.DestinationPath) }
-                if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время копирования. Подпись не сохранена.' }
-                $stage = 'Сохранение подписи'
-                Write-NewActFile -Path $item.SignaturePath -Bytes $signatureBytes
-                $row = New-ActResultRow $item $hash $thumb 'signed_verified' 'Новая подпись создана и проверена; исходный акт не изменён.'
+                else {
+                    $stage = 'Подготовка'
+                    $signatureDirectory = [System.IO.Path]::GetDirectoryName($item.SignaturePath)
+                    Test-ActWritableDirectory $signatureDirectory
+                    Assert-ActSafeExistingAncestors $item.SignaturePath
+                    if ([System.IO.File]::Exists($item.SignaturePath) -or [System.IO.Directory]::Exists($item.SignaturePath)) { throw ('Путь подписи уже занят: ' + $item.SignaturePath) }
+                    if ($copy) {
+                        [void](Assert-ActCopyDestination -Path $item.DocumentOutputPath -ExpectedHash $sourceState.Hash)
+                        $copies.Add([pscustomobject]@{ State = $sourceState; DestinationPath = $item.DocumentOutputPath })
+                        foreach ($companion in @(Get-ActCompanions $item)) {
+                            $state = Open-ActReadState -Path $companion
+                            $states.Add($state)
+                            $destination = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($item.DocumentOutputPath), [System.IO.Path]::GetFileName($companion))
+                            [void](Assert-ActCopyDestination -Path $destination -ExpectedHash $state.Hash)
+                            $copies.Add([pscustomobject]@{ State = $state; DestinationPath = $destination })
+                        }
+                    }
+                    Send-ActProgress $OnProgress ($index + 1) $items.Count $item 'signing' 'Подписание исходного акта.'
+                    # Console progress is synchronous and can pause. Recheck after
+                    # it returns, immediately before any private-key operation.
+                    $stage = 'Проверка соседних подписей'
+                    Assert-ActNeighborSignaturesUnchanged $item $neighborCheck
+                    if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился до начала подписания.' }
+                    $stage = 'Подписание'
+                    [byte[]]$signatureBytes = & $SignBlock ([byte[]]$sourceState.Bytes)
+                    if ($null -eq $signatureBytes -or $signatureBytes.Length -eq 0) { throw 'Средство подписи вернуло пустой результат.' }
+                    if ($signatureBytes.Length -gt $script:ActMaxBytes) { throw 'Размер подписи превышает 64 МиБ.' }
+                    $stage = 'Проверка подписи'
+                    & $VerifyBlock ([byte[]]$sourceState.Bytes) $signatureBytes $thumb | Out-Null
+                    $stage = 'Повторная проверка исходника'
+                    if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время подписания. Подпись не сохранена.' }
+                    $stage = 'Проверка соседних подписей'
+                    Assert-ActNeighborSignaturesUnchanged $item $neighborCheck
+                    $stage = 'Сохранение комплекта'
+                    foreach ($copyItem in $copies) { [void](Copy-ActStateNoOverwrite -State $copyItem.State -DestinationPath $copyItem.DestinationPath) }
+                    if ((Get-ActSha256 -Path $item.SourcePath) -ne $hash) { throw 'Исходный файл изменился во время копирования. Подпись не сохранена.' }
+                    # Companion signatures copied by this batch are expected additions;
+                    # every other late addition/change still blocks publication.
+                    foreach ($copyItem in $copies) {
+                        if ((Test-ActSignatureExtension $copyItem.DestinationPath) -and @($neighborCheck.Paths | Where-Object { Test-ActSamePath $_ $copyItem.DestinationPath }).Count -eq 0) {
+                            $neighborCheck.Paths = @($neighborCheck.Paths) + @($copyItem.DestinationPath)
+                            $neighborCheck.Records.Add([pscustomobject]@{ Path = $copyItem.DestinationPath; Hash = $copyItem.State.Hash })
+                        }
+                    }
+                    $stage = 'Проверка соседних подписей'
+                    Assert-ActNeighborSignaturesUnchanged $item $neighborCheck
+                    $stage = 'Сохранение подписи'
+                    Write-NewActFile -Path $item.SignaturePath -Bytes $signatureBytes
+                    $row = New-ActResultRow $item $hash $thumb 'signed_verified' 'Новая подпись создана и проверена; исходный акт не изменён.'
+                }
             }
             catch {
                 $stopped = $true
@@ -409,7 +534,8 @@ function Invoke-ActBatch {
         LogPath = $logPath
         Stopped = $stopped
         CompletedCount = @($allRows | Where-Object { $_.Status -eq 'signed_verified' }).Count
-        SkippedCount = @($allRows | Where-Object { $_.Status -eq 'exists_unverified' }).Count
+        SkippedCount = @($allRows | Where-Object { $_.Status -in @('exists_unverified', 'already_signed') }).Count
+        AlreadySignedCount = @($allRows | Where-Object { $_.Status -eq 'already_signed' }).Count
         ErrorCount = @($allRows | Where-Object { $_.Status -eq 'error' }).Count
         NotProcessedCount = @($allRows | Where-Object { $_.Status -eq 'not_processed' }).Count
     }
