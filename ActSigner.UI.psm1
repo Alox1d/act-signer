@@ -37,7 +37,7 @@ function Get-ActCertificateDetailsText {
     }
     $messages = @($Warnings | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($messages.Count -gt 0) {
-        # Show diagnostic messages at the top, even in a short VM window.
+        # Keep diagnostic messages first in the details dialog.
         return ((@('Диагностика:') + $messages + @('') + $lines.ToArray()) -join [Environment]::NewLine)
     }
     return ($lines.ToArray() -join [Environment]::NewLine)
@@ -88,6 +88,7 @@ function Show-ActSignerWindow {
         Certificates = @()
         CertificateWarnings = @()
         CertificateReadError = ''
+        CertificateDetailsText = 'Список сертификатов будет загружен при открытии окна.'
         Busy = $false
         SuppressChanges = $false
         SuppressGridEvents = $false
@@ -100,7 +101,7 @@ function Show-ActSignerWindow {
     }
     $ui = @{}
     $baseFont = New-Object System.Drawing.Font('Segoe UI', 9)
-    $titleFont = New-Object System.Drawing.Font('Segoe UI', 17, [System.Drawing.FontStyle]::Bold)
+    $titleFont = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
     $toolTip = New-Object System.Windows.Forms.ToolTip
     $toolTip.AutoPopDelay = 20000
     $toolTip.InitialDelay = 350
@@ -108,246 +109,211 @@ function Show-ActSignerWindow {
 
     $form = New-Object System.Windows.Forms.Form
     $ui.Form = $form
-    $form.Text = 'Подписание актов 1.1'
+    $form.SuspendLayout()
+    $form.Text = 'Подписание актов 1.3'
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
     $form.Font = $baseFont
+    $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
     $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $availableWidth = [Math]::Max(200, $workArea.Width - 32)
     $availableHeight = [Math]::Max(200, $workArea.Height - 32)
-    $form.MinimumSize = New-Object System.Drawing.Size(
-        [Math]::Min(640, $availableWidth),
-        [Math]::Min(480, $availableHeight)
-    )
-    $form.Size = New-Object System.Drawing.Size(
-        [Math]::Min(1100, $availableWidth),
-        [Math]::Min(820, $availableHeight)
-    )
+    $form.MinimumSize = New-Object System.Drawing.Size([Math]::Min(640, $availableWidth), [Math]::Min(480, $availableHeight))
+    $form.Size = New-Object System.Drawing.Size([Math]::Min(1180, $availableWidth), [Math]::Min(800, $availableHeight))
 
-    # Keep the content readable in small VM windows; scroll instead of clipping it.
-    $viewport = New-Object System.Windows.Forms.Panel
-    $viewport.Dock = 'Fill'
-    $viewport.AutoScroll = $true
-    $viewport.AutoScrollMinSize = New-Object System.Drawing.Size(880, 650)
-    [void]$form.Controls.Add($viewport)
+    # Only the grid scrolls. Setup rows use their preferred height; the acts
+    # receive the remaining space and the footer stays inside the window.
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
-    $layout.Dock = 'Top'
-    $layout.MinimumSize = New-Object System.Drawing.Size(880, 650)
-    $layout.Height = [Math]::Max(650, $form.ClientSize.Height)
-    $layout.Padding = New-Object System.Windows.Forms.Padding(16, 12, 16, 12)
+    $layout.Dock = 'Fill'
+    $layout.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 10)
     $layout.ColumnCount = 1
-    $layout.RowCount = 5
+    $layout.RowCount = 4
     [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    foreach ($height in @(52, 158, 188)) {
-        [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
-    }
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 58)))
-    [void]$viewport.Controls.Add($layout)
-    $viewport.Add_ClientSizeChanged({
-        $layout.Height = [Math]::Max(650, $viewport.ClientSize.Height)
-    }.GetNewClosure())
-
-    $heading = New-Object System.Windows.Forms.TableLayoutPanel
-    $heading.Dock = 'Fill'
-    $heading.Margin = New-Object System.Windows.Forms.Padding(0)
-    $heading.ColumnCount = 1
-    $heading.RowCount = 2
-    [void]$heading.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 29)))
-    [void]$heading.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$form.Controls.Add($layout)
     $title = New-Object System.Windows.Forms.Label
     $title.Text = 'Подписать акты своей ЭП'
     $title.Font = $titleFont
-    $title.Dock = 'Fill'
-    $title.Margin = New-Object System.Windows.Forms.Padding(0)
-    $subtitle = New-Object System.Windows.Forms.Label
-    $subtitle.Text = 'Отдельный файл .my.sig для каждого выбранного PDF.'
-    $subtitle.Dock = 'Fill'
-    $subtitle.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
-    [void]$heading.Controls.Add($title, 0, 0)
-    [void]$heading.Controls.Add($subtitle, 0, 1)
-    [void]$layout.Controls.Add($heading, 0, 0)
+    $title.AutoSize = $true
+    $title.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    [void]$layout.Controls.Add($title, 0, 0)
 
-    $folderGroup = New-Object System.Windows.Forms.GroupBox
-    $folderGroup.Text = '1. Папки'
-    $folderGroup.Dock = 'Fill'
-    $folderGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
-    $folderGroup.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 7)
+    $makeButton = {
+        param([string]$Text, [int]$Width, [int]$Height = 28)
+        $button = New-Object System.Windows.Forms.Button
+        $button.Text = $Text
+        $button.AutoSize = $true
+        $button.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $button.MinimumSize = New-Object System.Drawing.Size($Width, $Height)
+        $button.Padding = New-Object System.Windows.Forms.Padding(8, 3, 8, 3)
+        $button.UseVisualStyleBackColor = $true
+        return $button
+    }
     $folders = New-Object System.Windows.Forms.TableLayoutPanel
     $folders.Dock = 'Fill'
+    $folders.AutoSize = $true
+    $folders.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $folders.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 7)
     $folders.ColumnCount = 3
-    $folders.RowCount = 4
-    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 125)))
+    $folders.RowCount = 5
+    $folders.TabIndex = 0
+    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 104)))
-    foreach ($height in @(30, 30, 27)) {
-        [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
+    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    for ($i = 0; $i -lt 5; $i++) {
+        [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     }
-    [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-
     $sourceLabel = New-Object System.Windows.Forms.Label
     $sourceLabel.Text = 'Папка с актами:'
-    $sourceLabel.Dock = 'Fill'
-    $sourceLabel.TextAlign = 'MiddleLeft'
+    $sourceLabel.AutoSize = $true
+    $sourceLabel.Anchor = 'Left'
+    $sourceLabel.Margin = New-Object System.Windows.Forms.Padding(0, 4, 10, 4)
     $sourceBox = New-Object System.Windows.Forms.TextBox
     $ui.Source = $sourceBox
     $sourceBox.Dock = 'Fill'
+    $sourceBox.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
     $sourceBox.Text = $settings.SourceRoot
+    $sourceBox.TabIndex = 0
     $sourceBox.AccessibleName = 'Папка с исходными актами'
-    $sourceBrowse = New-Object System.Windows.Forms.Button
+    $sourceBrowse = & $makeButton 'Выбрать...' 90
     $ui.SourceBrowse = $sourceBrowse
-    $sourceBrowse.Text = 'Выбрать...'
     $sourceBrowse.Dock = 'Fill'
     $sourceBrowse.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
-    $sourceBrowse.UseVisualStyleBackColor = $true
+    $sourceBrowse.TabIndex = 1
     [void]$folders.Controls.Add($sourceLabel, 0, 0)
     [void]$folders.Controls.Add($sourceBox, 1, 0)
     [void]$folders.Controls.Add($sourceBrowse, 2, 0)
-
-    $outputLabel = New-Object System.Windows.Forms.Label
-    $outputLabel.Text = 'Папка результата:'
-    $outputLabel.Dock = 'Fill'
-    $outputLabel.TextAlign = 'MiddleLeft'
-    $outputBox = New-Object System.Windows.Forms.TextBox
-    $ui.Output = $outputBox
-    $outputBox.Dock = 'Fill'
-    $outputBox.Text = $defaultOutput
-    $outputBox.AccessibleName = 'Папка для PDF и подписей'
-    $outputBrowse = New-Object System.Windows.Forms.Button
-    $ui.OutputBrowse = $outputBrowse
-    $outputBrowse.Text = 'Выбрать...'
-    $outputBrowse.Dock = 'Fill'
-    $outputBrowse.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
-    $outputBrowse.UseVisualStyleBackColor = $true
-    [void]$folders.Controls.Add($outputLabel, 0, 1)
-    [void]$folders.Controls.Add($outputBox, 1, 1)
-    [void]$folders.Controls.Add($outputBrowse, 2, 1)
 
     $beside = New-Object System.Windows.Forms.CheckBox
     $ui.Beside = $beside
     $beside.Text = 'Сохранять рядом с исходниками'
     $beside.Checked = [bool]$settings.SaveBesideSources
-    $beside.Dock = 'Fill'
-    [void]$folders.Controls.Add($beside, 1, 2)
+    $beside.AutoSize = $true
+    $beside.Anchor = 'Left'
+    $beside.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 5)
+    $beside.TabIndex = 2
+    [void]$folders.Controls.Add($beside, 1, 1)
     $folders.SetColumnSpan($beside, 2)
-    $outputHint = New-Object System.Windows.Forms.Label
-    $ui.OutputHint = $outputHint
-    $outputHint.Text = 'В отдельную папку будут скопированы выбранные PDF и новые подписи. Структура подпапок сохранится.'
-    $outputHint.Dock = 'Fill'
-    $outputHint.AutoEllipsis = $true
-    $outputHint.ForeColor = [Drawing.SystemColors]::GrayText
-    [void]$folders.Controls.Add($outputHint, 1, 3)
-    $folders.SetColumnSpan($outputHint, 2)
-    [void]$folderGroup.Controls.Add($folders)
-    [void]$layout.Controls.Add($folderGroup, 0, 1)
+    $outputLabel = New-Object System.Windows.Forms.Label
+    $ui.OutputLabel = $outputLabel
+    $outputLabel.Text = 'Папка результата:'
+    $outputLabel.AutoSize = $true
+    $outputLabel.Anchor = 'Left'
+    $outputLabel.Margin = New-Object System.Windows.Forms.Padding(0, 4, 10, 4)
+    $outputBox = New-Object System.Windows.Forms.TextBox
+    $ui.Output = $outputBox
+    $outputBox.Dock = 'Fill'
+    $outputBox.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
+    $outputBox.Text = $defaultOutput
+    $outputBox.TabIndex = 3
+    $outputBox.AccessibleName = 'Папка для PDF и подписей'
+    $outputBrowse = & $makeButton 'Выбрать...' 90
+    $ui.OutputBrowse = $outputBrowse
+    $outputBrowse.Dock = 'Fill'
+    $outputBrowse.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
+    $outputBrowse.TabIndex = 4
+    [void]$folders.Controls.Add($outputLabel, 0, 2)
+    [void]$folders.Controls.Add($outputBox, 1, 2)
+    [void]$folders.Controls.Add($outputBrowse, 2, 2)
 
-    $certificateGroup = New-Object System.Windows.Forms.GroupBox
-    $certificateGroup.Text = '2. Сертификат для подписи'
-    $certificateGroup.Dock = 'Fill'
-    $certificateGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
-    $certificateGroup.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 7)
+    $certificateLabel = New-Object System.Windows.Forms.Label
+    $certificateLabel.Text = 'Сертификат:'
+    $certificateLabel.AutoSize = $true
+    $certificateLabel.Anchor = 'Left'
+    $certificateLabel.Margin = New-Object System.Windows.Forms.Padding(0, 4, 10, 4)
+    [void]$folders.Controls.Add($certificateLabel, 0, 3)
     $certificateLayout = New-Object System.Windows.Forms.TableLayoutPanel
     $certificateLayout.Dock = 'Fill'
-    $certificateLayout.ColumnCount = 2
-    $certificateLayout.RowCount = 4
+    $certificateLayout.AutoSize = $true
+    $certificateLayout.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $certificateLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+    $certificateLayout.ColumnCount = 3
+    $certificateLayout.RowCount = 1
+    $certificateLayout.TabIndex = 5
     [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 112)))
-    foreach ($height in @(22, 31)) {
-        [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
-    }
-    [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 25)))
-    $certificateHint = New-Object System.Windows.Forms.Label
-    $certificateHint.Text = 'Показываем доступные сертификаты КриптоПро. Для повторного поиска нажмите Обновить.'
-    $certificateHint.Dock = 'Fill'
-    [void]$certificateLayout.Controls.Add($certificateHint, 0, 0)
-    $certificateLayout.SetColumnSpan($certificateHint, 2)
+    [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     $certificateBox = New-Object System.Windows.Forms.ComboBox
     $ui.Certificate = $certificateBox
     $certificateBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
     $certificateBox.Dock = 'Fill'
+    $certificateBox.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
     $certificateBox.IntegralHeight = $false
     $certificateBox.MaxDropDownItems = 10
     $certificateBox.DropDownHeight = 230
-    $certificateBox.DropDownWidth = 900
+    $certificateBox.DropDownWidth = [Math]::Min(900, $availableWidth)
     $certificateBox.AccessibleName = 'Сертификат для подписания'
-    $refresh = New-Object System.Windows.Forms.Button
+    $certificateBox.TabIndex = 0
+    $refresh = & $makeButton 'Обновить' 86
     $ui.Refresh = $refresh
-    $refresh.Text = 'Обновить'
     $refresh.Dock = 'Fill'
     $refresh.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
-    $refresh.UseVisualStyleBackColor = $true
-    [void]$certificateLayout.Controls.Add($certificateBox, 0, 1)
-    [void]$certificateLayout.Controls.Add($refresh, 1, 1)
-    $certificateDetails = New-Object System.Windows.Forms.TextBox
-    $ui.CertificateDetails = $certificateDetails
-    $certificateDetails.Multiline = $true
-    $certificateDetails.ReadOnly = $true
-    $certificateDetails.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
-    $certificateDetails.Dock = 'Fill'
-    $certificateDetails.BackColor = [Drawing.SystemColors]::Window
-    $certificateDetails.Text = 'Список сертификатов будет загружен при открытии окна.'
-    $certificateDetails.AccessibleName = 'Данные сертификата и диагностика'
-    [void]$certificateLayout.Controls.Add($certificateDetails, 0, 2)
-    $certificateLayout.SetColumnSpan($certificateDetails, 2)
+    $refresh.TabIndex = 1
+    $details = & $makeButton 'Подробнее' 94
+    $ui.Details = $details
+    $details.Dock = 'Fill'
+    $details.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
+    $details.AccessibleName = 'Данные сертификата и диагностика: открыть'
+    $details.TabIndex = 2
+    [void]$certificateLayout.Controls.Add($certificateBox, 0, 0)
+    [void]$certificateLayout.Controls.Add($refresh, 1, 0)
+    [void]$certificateLayout.Controls.Add($details, 2, 0)
+    [void]$folders.Controls.Add($certificateLayout, 1, 3)
+    $folders.SetColumnSpan($certificateLayout, 2)
     $certificateStatus = New-Object System.Windows.Forms.Label
     $ui.CertificateStatus = $certificateStatus
     $certificateStatus.Dock = 'Fill'
+    $certificateStatus.Height = 20
+    $certificateStatus.MinimumSize = New-Object System.Drawing.Size(0, 20)
+    $certificateStatus.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 1)
     $certificateStatus.AutoEllipsis = $true
     $certificateStatus.TextAlign = 'MiddleLeft'
-    [void]$certificateLayout.Controls.Add($certificateStatus, 0, 3)
-    $certificateLayout.SetColumnSpan($certificateStatus, 2)
-    [void]$certificateGroup.Controls.Add($certificateLayout)
-    [void]$layout.Controls.Add($certificateGroup, 0, 2)
+    $certificateStatus.AccessibleName = 'Состояние сертификатов'
+    [void]$folders.Controls.Add($certificateStatus, 1, 4)
+    $folders.SetColumnSpan($certificateStatus, 2)
+    [void]$layout.Controls.Add($folders, 0, 1)
 
-    $actGroup = New-Object System.Windows.Forms.GroupBox
-    $actGroup.Text = '3. Акты для подписи'
-    $actGroup.Dock = 'Fill'
-    $actGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
-    $actGroup.Margin = New-Object System.Windows.Forms.Padding(0)
     $actLayout = New-Object System.Windows.Forms.TableLayoutPanel
     $actLayout.Dock = 'Fill'
+    $actLayout.Margin = New-Object System.Windows.Forms.Padding(0)
     $actLayout.ColumnCount = 1
-    $actLayout.RowCount = 4
-    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 35)))
-    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 34)))
+    $actLayout.RowCount = 2
+    $actLayout.TabIndex = 1
+    [void]$actLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 25)))
-    $matchHint = New-Object System.Windows.Forms.Label
-    $matchHint.Text = 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.'
-    $matchHint.Dock = 'Fill'
-    $matchHint.AutoEllipsis = $true
-    [void]$actLayout.Controls.Add($matchHint, 0, 0)
     $toolbar = New-Object System.Windows.Forms.FlowLayoutPanel
     $toolbar.Dock = 'Fill'
+    $toolbar.AutoSize = $true
+    $toolbar.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
     $toolbar.Margin = New-Object System.Windows.Forms.Padding(0)
-    $toolbar.WrapContents = $false
-    $find = New-Object System.Windows.Forms.Button
+    $toolbar.WrapContents = $true
+    $toolbar.TabIndex = 0
+    $find = & $makeButton 'Найти акты' 130 30
     $ui.Find = $find
-    $find.Text = 'Найти акты'
-    $find.Size = New-Object System.Drawing.Size(130, 28)
-    $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
-    $find.UseVisualStyleBackColor = $true
-    $selectNew = New-Object System.Windows.Forms.Button
+    $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
+    $find.TabIndex = 0
+    $selectNew = & $makeButton 'Выбрать все новые' 155 30
     $ui.SelectNew = $selectNew
-    $selectNew.Text = 'Выбрать все новые'
-    $selectNew.Size = New-Object System.Drawing.Size(155, 28)
-    $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
-    $selectNew.UseVisualStyleBackColor = $true
-    $clearSelection = New-Object System.Windows.Forms.Button
+    $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
+    $selectNew.TabIndex = 1
+    $clearSelection = & $makeButton 'Снять выбор' 115 30
     $ui.ClearSelection = $clearSelection
-    $clearSelection.Text = 'Снять выбор'
-    $clearSelection.Size = New-Object System.Drawing.Size(115, 28)
-    $clearSelection.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
-    $clearSelection.UseVisualStyleBackColor = $true
+    $clearSelection.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    $clearSelection.TabIndex = 2
     [void]$toolbar.Controls.Add($find)
     [void]$toolbar.Controls.Add($selectNew)
     [void]$toolbar.Controls.Add($clearSelection)
-    [void]$actLayout.Controls.Add($toolbar, 0, 1)
+    [void]$actLayout.Controls.Add($toolbar, 0, 0)
 
     $grid = New-Object System.Windows.Forms.DataGridView
     $ui.Grid = $grid
     $grid.Dock = 'Fill'
+    $grid.Margin = New-Object System.Windows.Forms.Padding(0)
     $grid.BackgroundColor = [Drawing.SystemColors]::Window
     $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $grid.AllowUserToAddRows = $false
@@ -359,80 +325,92 @@ function Show-ActSignerWindow {
     $grid.MultiSelect = $false
     $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
     $grid.EditMode = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
-    $grid.RowTemplate.Height = 27
+    $grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::AllCellsExceptHeaders
+    $grid.RowTemplate.MinimumHeight = 28
+    $grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 3, 6, 3)
+    $grid.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
+    $grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+    $grid.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 4, 6, 4)
+    $grid.CellBorderStyle = [System.Windows.Forms.DataGridViewCellBorderStyle]::SingleHorizontal
+    if (-not [System.Windows.Forms.SystemInformation]::HighContrast) {
+        $grid.AlternatingRowsDefaultCellStyle.BackColor = [Drawing.Color]::FromArgb(248, 250, 252)
+        $grid.GridColor = [Drawing.Color]::FromArgb(225, 229, 234)
+    }
     $grid.AccessibleName = 'Предварительный список актов'
+    $grid.TabIndex = 1
     $checkColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
     $checkColumn.Name = 'Selected'
     $checkColumn.HeaderText = 'Выбор'
-    $checkColumn.Width = 58
+    $checkColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::ColumnHeader
+    $checkColumn.MinimumWidth = 58
     $checkColumn.Resizable = [System.Windows.Forms.DataGridViewTriState]::False
     $checkColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
     $pathColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $pathColumn.Name = 'RelativePath'
     $pathColumn.HeaderText = 'Файл и подпапка'
     $pathColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
-    $pathColumn.MinimumWidth = 300
+    $pathColumn.MinimumWidth = 220
     $pathColumn.ReadOnly = $true
     $pathColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
     $statusColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $statusColumn.Name = 'Status'
     $statusColumn.HeaderText = 'Статус'
-    $statusColumn.Width = 170
+    $statusColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells
     $statusColumn.ReadOnly = $true
     $statusColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
     [void]$grid.Columns.Add($checkColumn)
     [void]$grid.Columns.Add($pathColumn)
     [void]$grid.Columns.Add($statusColumn)
-    [void]$actLayout.Controls.Add($grid, 0, 2)
-    $summary = New-Object System.Windows.Forms.Label
-    $ui.Summary = $summary
-    $summary.Dock = 'Fill'
-    $summary.AutoEllipsis = $true
-    $summary.TextAlign = 'MiddleLeft'
-    $summary.Text = 'Выберите папку и нажмите Найти акты.'
-    [void]$actLayout.Controls.Add($summary, 0, 3)
-    [void]$actGroup.Controls.Add($actLayout)
-    [void]$layout.Controls.Add($actGroup, 0, 3)
+    [void]$actLayout.Controls.Add($grid, 0, 1)
+    [void]$layout.Controls.Add($actLayout, 0, 2)
 
     $footer = New-Object System.Windows.Forms.TableLayoutPanel
     $footer.Dock = 'Fill'
-    $footer.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
+    $footer.AutoSize = $true
+    $footer.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $footer.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
     $footer.ColumnCount = 3
     $footer.RowCount = 1
+    $footer.TabIndex = 2
     [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 230)))
-    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 102)))
-    $footerHint = New-Object System.Windows.Forms.Label
-    $footerHint.Dock = 'Fill'
-    $footerHint.Text = 'После нажатия окно закроется, подписание продолжится в консоли. КриптоПро может запросить PIN носителя.'
-    $footerHint.AutoEllipsis = $true
-    $footerHint.TextAlign = 'MiddleLeft'
-    $footerHint.ForeColor = [Drawing.SystemColors]::GrayText
-    $sign = New-Object System.Windows.Forms.Button
+    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$footer.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    $summary = New-Object System.Windows.Forms.Label
+    $ui.Summary = $summary
+    $summary.Dock = 'Fill'
+    $summary.Margin = New-Object System.Windows.Forms.Padding(0)
+    $summary.AutoEllipsis = $true
+    $summary.TextAlign = 'MiddleLeft'
+    $summary.Text = 'Выберите папку и нажмите Найти акты.'
+    $summary.AccessibleName = 'Итоги поиска и выбора актов'
+    $sign = & $makeButton 'Подписать' 210 34
     $ui.Sign = $sign
-    $sign.Text = 'Подписать'
+    $sign.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
     $sign.Dock = 'Fill'
-    $sign.Margin = New-Object System.Windows.Forms.Padding(8, 3, 8, 3)
-    $sign.UseVisualStyleBackColor = $true
+    $sign.Margin = New-Object System.Windows.Forms.Padding(8, 0, 8, 0)
     $sign.Enabled = $false
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = 'Отмена'
+    $sign.TabIndex = 0
+    $cancel = & $makeButton 'Отмена' 92 34
+    $cancel.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
     $cancel.Dock = 'Fill'
-    $cancel.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 3)
-    $cancel.UseVisualStyleBackColor = $true
+    $cancel.Margin = New-Object System.Windows.Forms.Padding(0)
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    [void]$footer.Controls.Add($footerHint, 0, 0)
+    $cancel.TabIndex = 1
+    [void]$footer.Controls.Add($summary, 0, 0)
     [void]$footer.Controls.Add($sign, 1, 0)
     [void]$footer.Controls.Add($cancel, 2, 0)
-    [void]$layout.Controls.Add($footer, 0, 4)
+    [void]$layout.Controls.Add($footer, 0, 3)
     $form.AcceptButton = $sign
     $form.CancelButton = $cancel
 
     $toolTip.SetToolTip($sourceBox, 'Можно выбрать папку или вставить путь, включая общую папку VM. Поиск включает подпапки.')
     $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут PDF и новые .my.sig.')
-    $toolTip.SetToolTip($beside, 'Для этого режима исходная папка должна быть доступна для записи.')
-    $toolTip.SetToolTip($matchHint, $matchHint.Text)
-    $toolTip.SetToolTip($footerHint, $footerHint.Text)
+    $toolTip.SetToolTip($beside, 'Каждая новая .my.sig сохраняется в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.')
+    $toolTip.SetToolTip($find, 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.')
+    $toolTip.SetToolTip($details, 'Полные данные выбранного сертификата и сообщения диагностики.')
+    $sign.AccessibleDescription = 'После нажатия окно закроется, подписание продолжится в консоли. КриптоПро может запросить PIN носителя.'
+    $toolTip.SetToolTip($sign, $sign.AccessibleDescription)
 
     $actWord = {
         param([int]$Count)
@@ -510,6 +488,7 @@ function Show-ActSignerWindow {
         $ui.SelectNew.Enabled = (-not $state.Busy) -and $newCount -gt 0
         $ui.ClearSelection.Enabled = (-not $state.Busy) -and $selectedCount -gt 0
         $ui.Refresh.Enabled = -not $state.Busy
+        $ui.Details.Enabled = -not $state.Busy
         $ui.Certificate.Enabled = (-not $state.Busy) -and $state.Certificates.Count -gt 0
         $ui.Source.Enabled = -not $state.Busy
         $ui.SourceBrowse.Enabled = -not $state.Busy
@@ -541,30 +520,86 @@ function Show-ActSignerWindow {
     $syncOutputToSource = {
         $wasSuppressed = $state.SuppressChanges
         $state.SuppressChanges = $true
+        $folders.SuspendLayout()
         try {
-            if ($ui.Beside.Checked) {
-                $ui.Output.Text = $ui.Source.Text
-                $ui.OutputHint.Text = 'Каждая новая .my.sig будет сохранена в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.'
-            }
-            else {
-                $ui.Output.Text = $state.SeparateOutputText
-                $ui.OutputHint.Text = 'В отдельную папку будут скопированы выбранные PDF и новые подписи. Структура подпапок сохранится.'
-            }
+            if ($ui.Beside.Checked) { $ui.Output.Text = $ui.Source.Text }
+            else { $ui.Output.Text = $state.SeparateOutputText }
+            $showSeparateOutput = -not $ui.Beside.Checked
+            $ui.OutputLabel.Visible = $showSeparateOutput
+            $ui.Output.Visible = $showSeparateOutput
+            $ui.OutputBrowse.Visible = $showSeparateOutput
         }
-        finally { $state.SuppressChanges = $wasSuppressed }
-        $toolTip.SetToolTip($ui.OutputHint, $ui.OutputHint.Text)
+        finally {
+            $state.SuppressChanges = $wasSuppressed
+            $folders.ResumeLayout($true)
+        }
     }.GetNewClosure()
 
     $showCertificate = {
         $index = $ui.Certificate.SelectedIndex
         $cert = $null
         if ($index -ge 0 -and $index -lt $state.Certificates.Count) { $cert = $state.Certificates[$index] }
-        $ui.CertificateDetails.Text = & $certificateTextBuilder -CertificateInfo $cert -CertificateCount $state.Certificates.Count `
+        $state.CertificateDetailsText = & $certificateTextBuilder -CertificateInfo $cert -CertificateCount $state.Certificates.Count `
             -Warnings $state.CertificateWarnings -ReadError $state.CertificateReadError
-        $ui.CertificateDetails.SelectionStart = 0
-        $ui.CertificateDetails.SelectionLength = 0
-        $ui.CertificateDetails.ScrollToCaret()
+        $toolTip.SetToolTip($ui.Certificate, $ui.Certificate.Text)
         & $syncAction
+    }.GetNewClosure()
+
+    $openCertificateDetails = {
+        if ($state.Busy) { return }
+        $dialog = New-Object System.Windows.Forms.Form
+        try {
+            $dialog.SuspendLayout()
+            $dialog.Text = 'Сертификат и диагностика'
+            $dialog.Font = $ui.Form.Font
+            $dialog.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
+            $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+            $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+            $dialog.ShowInTaskbar = $false
+            $dialog.MinimizeBox = $false
+            $area = [System.Windows.Forms.Screen]::FromControl($ui.Form).WorkingArea
+            $width = [Math]::Max(200, $area.Width - 32)
+            $height = [Math]::Max(200, $area.Height - 32)
+            $dialog.MinimumSize = New-Object System.Drawing.Size([Math]::Min(480, $width), [Math]::Min(300, $height))
+            $dialog.Size = New-Object System.Drawing.Size([Math]::Min(820, $width), [Math]::Min(520, $height))
+            $detailsLayout = New-Object System.Windows.Forms.TableLayoutPanel
+            $detailsLayout.Dock = 'Fill'
+            $detailsLayout.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 10)
+            $detailsLayout.ColumnCount = 1
+            $detailsLayout.RowCount = 2
+            [void]$detailsLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$detailsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$detailsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+            $textBox = New-Object System.Windows.Forms.TextBox
+            $textBox.Multiline = $true
+            $textBox.ReadOnly = $true
+            $textBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+            $textBox.Dock = 'Fill'
+            $textBox.Margin = New-Object System.Windows.Forms.Padding(0)
+            $textBox.BackColor = [Drawing.SystemColors]::Window
+            $textBox.Text = $state.CertificateDetailsText
+            $textBox.SelectionStart = 0
+            $textBox.SelectionLength = 0
+            $textBox.AccessibleName = 'Данные сертификата и диагностика'
+            $close = New-Object System.Windows.Forms.Button
+            $close.Text = 'Закрыть'
+            $close.AutoSize = $true
+            $close.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $close.MinimumSize = New-Object System.Drawing.Size(92, 32)
+            $close.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
+            $close.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+            $close.Anchor = 'Right'
+            $close.UseVisualStyleBackColor = $true
+            $close.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+            [void]$detailsLayout.Controls.Add($textBox, 0, 0)
+            [void]$detailsLayout.Controls.Add($close, 0, 1)
+            [void]$dialog.Controls.Add($detailsLayout)
+            $dialog.AcceptButton = $close
+            $dialog.CancelButton = $close
+            $dialog.ResumeLayout($true)
+            [void]$dialog.ShowDialog($ui.Form)
+        }
+        finally { $dialog.Dispose() }
     }.GetNewClosure()
 
     $refreshCertificates = {
@@ -579,7 +614,7 @@ function Show-ActSignerWindow {
         $state.CertificateReadError = ''
         $ui.Certificate.Items.Clear()
         $ui.Certificate.SelectedIndex = -1
-        $ui.CertificateDetails.Text = 'Читаем сертификаты из доступных хранилищ...'
+        $state.CertificateDetailsText = 'Читаем сертификаты из доступных хранилищ...'
         $ui.CertificateStatus.Text = ''
         $ui.Refresh.Text = 'Чтение...'
         $ui.Form.UseWaitCursor = $true
@@ -618,11 +653,11 @@ function Show-ActSignerWindow {
             $ui.Certificate.SelectedIndex = $restoreIndex
             $warnings = $state.CertificateWarnings
             if ($state.Certificates.Count -eq 0) {
-                $statusText = 'Сертификаты для подписи не найдены.'
+                $statusText = 'Сертификаты не найдены. Откройте Подробнее.'
                 $ui.CertificateStatus.ForeColor = [Drawing.Color]::Firebrick
             }
             elseif ($warnings.Count -gt 0) {
-                $statusText = 'Найдено сертификатов: {0}. Сообщения диагностики показаны выше.' -f $state.Certificates.Count
+                $statusText = 'Найдено сертификатов: {0}. Диагностика: Подробнее.' -f $state.Certificates.Count
                 $ui.CertificateStatus.ForeColor = [Drawing.Color]::DarkGoldenrod
             }
             else {
@@ -643,7 +678,7 @@ function Show-ActSignerWindow {
             $state.CertificateReadError = $_.Exception.Message
             $ui.Certificate.Items.Clear()
             & $showCertificate
-            $ui.CertificateStatus.Text = 'Сертификаты не загружены. Причина показана выше.'
+            $ui.CertificateStatus.Text = 'Сертификаты не загружены. Причина: Подробнее.'
             $ui.CertificateStatus.ForeColor = [Drawing.Color]::Firebrick
             $toolTip.SetToolTip($ui.CertificateStatus, $_.Exception.Message)
         }
@@ -773,6 +808,7 @@ function Show-ActSignerWindow {
     $sourceBrowse.Add_Click({ & $browseFolder $false }.GetNewClosure())
     $outputBrowse.Add_Click({ & $browseFolder $true }.GetNewClosure())
     $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())
+    $details.Add_Click({ & $openCertificateDetails }.GetNewClosure())
     $certificateBox.Add_SelectedIndexChanged({ & $showCertificate }.GetNewClosure())
     $find.Add_Click({ & $findActs }.GetNewClosure())
     $grid.Add_CurrentCellDirtyStateChanged({
@@ -846,6 +882,7 @@ function Show-ActSignerWindow {
 
     & $syncOutputToSource
     & $syncAction
+    $form.ResumeLayout($true)
     try {
         [void]$form.ShowDialog()
         return $state.Result

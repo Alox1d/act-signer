@@ -37,8 +37,20 @@ $fixturePlan = [pscustomobject]@{
     Root = 'C:\SyntheticActs'; OutputRoot = 'C:\SyntheticOutput'; SeparateOutput = $true
     Items = $items; SkippedReparsePoints = @()
 }
-$certificateProvider = { [pscustomobject]@{ Certificates = @($certificate); Warnings = @() } }.GetNewClosure()
-$planProvider = { param($SourceRoot, $DestinationRoot) return $fixturePlan }.GetNewClosure()
+$syntheticWarning = 'SYNTHETIC DIAGNOSTIC WARNING'
+$syntheticReadError = 'SYNTHETIC CERTIFICATE READ FAILURE'
+$certificateProvider = { [pscustomobject]@{ Certificates = @($certificate); Warnings = @($syntheticWarning) } }.GetNewClosure()
+$providerCalls = @{ Count = 0; SourceRoot = ''; DestinationRoot = '' }
+$planProvider = {
+    param($SourceRoot, $DestinationRoot)
+    $providerCalls.Count++
+    $providerCalls.SourceRoot = [string]$SourceRoot
+    $providerCalls.DestinationRoot = [string]$DestinationRoot
+    return [pscustomobject]@{
+        Root = $SourceRoot; OutputRoot = $DestinationRoot; SeparateOutput = ($SourceRoot -ne $DestinationRoot)
+        Items = $fixturePlan.Items; SkippedReparsePoints = @()
+    }
+}.GetNewClosure()
 $state = @{ Phase = 0; Form = $null; Grid = $null; Controls = @(); Error = $null; Started = [datetime]::UtcNow }
 $failures = New-Object 'System.Collections.Generic.List[string]'
 $measurements = New-Object 'System.Collections.Generic.List[object]'
@@ -103,6 +115,69 @@ $measure = {
     foreach ($button in $buttonInfo) { & $assert $button.FullyVisible ($Name + ': button is clipped: ' + $button.Text) }
 }.GetNewClosure()
 
+$inspectDetails = {
+    param([bool]$ReadFailure)
+    $detailsButtons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text.TrimEnd('.') -eq 'Подробнее' })
+    if ($detailsButtons.Count -ne 1) { throw 'Expected one Details button.' }
+    $detailsButton = $detailsButtons[0]
+    & $assert ($detailsButton.Visible -and $detailsButton.Enabled) 'Details must remain available, including after certificate read failure.'
+    $dialogState = @{ Dialog = $null; Error = $null; Seen = $false; Started = [datetime]::UtcNow }
+    $dialogTimer = New-Object System.Windows.Forms.Timer
+    $dialogTimer.Interval = 100
+    $dialogTimer.Add_Tick({
+        try {
+            $dialogs = @([System.Windows.Forms.Application]::OpenForms | Where-Object { $_ -ne $state.Form })
+            if ($dialogs.Count -eq 0) {
+                if (([datetime]::UtcNow - $dialogState.Started).TotalSeconds -gt 5) { throw 'Details dialog did not appear.' }
+                return
+            }
+            $dialog = $dialogs[0]
+            $dialogState.Dialog = $dialog; $dialogState.Seen = $true
+            & $assert $dialog.Modal 'Details must be modal.'
+            & $assert ([object]::ReferenceEquals($dialog.Owner, $state.Form)) 'Details must be owned by the main form.'
+            & $assert ($dialog.FormBorderStyle -eq [System.Windows.Forms.FormBorderStyle]::Sizable) 'Details must have a resizable border.'
+            $texts = @((& $walk $dialog) | Where-Object { $_ -is [System.Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Данные сертификата и диагностика' })
+            & $assert ($texts.Count -eq 1) 'Details must expose the accessible certificate diagnostics text.'
+            if ($texts.Count -eq 1) {
+                $text = $texts[0]
+                & $assert ($text.ReadOnly -and $text.Multiline) 'Certificate diagnostics must be a multiline read-only text box.'
+                if ($ReadFailure) {
+                    & $assert ($text.Text.Contains($syntheticReadError)) 'Details must retain the certificate read error.'
+                    & $assert ($text.Text.Contains('Не удалось прочитать сертификаты.')) 'Details must explain the read failure.'
+                }
+                else {
+                    foreach ($expected in @($certificate.Subject, $certificate.Issuer, $certificate.Thumbprint, $certificate.Source, $syntheticWarning)) {
+                        & $assert ($text.Text.Contains([string]$expected)) ('Details omitted synthetic metadata: ' + $expected)
+                    }
+                }
+                $originalSize = $dialog.Size
+                $dialog.Size = New-Object Drawing.Size(($originalSize.Width + 40), ($originalSize.Height + 40))
+                & $assert ($dialog.Width -gt $originalSize.Width -and $dialog.Height -gt $originalSize.Height) 'Details must accept a larger size.'
+                & $assert ([bool](& $fullyVisible $text)) 'Details text must stay within the resized dialog.'
+            }
+            $close = $dialog.CancelButton
+            & $assert ($null -ne $close -and $close -is [System.Windows.Forms.Button]) 'Details must assign its Close button as the Escape action.'
+            & $assert ([object]::ReferenceEquals($dialog.AcceptButton, $close)) 'Details must assign the same Close button as its Enter action.'
+            if ($null -ne $close) { & $assert ([bool](& $fullyVisible $close)) 'Details Close button must be visible.' }
+            $dialogTimer.Stop()
+            if ($null -ne $close) { $close.PerformClick() } else { $dialog.Close() }
+        }
+        catch {
+            $dialogState.Error = $_.Exception.ToString()
+            $dialogTimer.Stop()
+            foreach ($dialog in @([System.Windows.Forms.Application]::OpenForms | Where-Object { $_ -ne $state.Form })) { $dialog.Close() }
+        }
+    }.GetNewClosure())
+    try {
+        $dialogTimer.Start()
+        $detailsButton.PerformClick()
+        if ($null -ne $dialogState.Error) { throw $dialogState.Error }
+        & $assert $dialogState.Seen 'Details button must open a dialog.'
+        if ($null -ne $dialogState.Dialog) { & $assert $dialogState.Dialog.IsDisposed 'Details dialog must be disposed after closing.' }
+    }
+    finally { $dialogTimer.Stop(); $dialogTimer.Dispose() }
+}.GetNewClosure()
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 200
 $timer.Add_Tick({
@@ -132,6 +207,34 @@ $timer.Add_Tick({
         }
         if ($state.Phase -eq 2) {
             & $measure '900x600' 5
+            # A nested timer inspects the real owned modal while ShowDialog runs.
+            $state.Phase = 20
+            & $inspectDetails $false
+            $output = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для PDF и подписей' })[0]
+            $beside = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] -and $_.Text -eq 'Сохранять рядом с исходниками' })[0]
+            $find = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
+            if ($output.Parent -isnot [System.Windows.Forms.TableLayoutPanel]) { throw 'Separate-output field must be in its folder table.' }
+            $outputRow = $output.Parent.GetRow($output)
+            $outputControls = @($output.Parent.Controls | Where-Object { $output.Parent.GetRow($_) -eq $outputRow })
+            & $assert ($outputControls.Count -ge 3) 'Expected output label, field, and browse button in the separate-output row.'
+            $priorOutput = 'C:\SyntheticPreviousOutput'
+            $output.Text = $priorOutput
+            $find.PerformClick()
+            & $assert ($state.Grid.Rows.Count -eq 20) 'Refind after editing the separate-output path must populate the plan.'
+            $beside.Checked = $true
+            & $assert ($state.Grid.Rows.Count -eq 0 -and -not $state.Form.AcceptButton.Enabled) 'Enabling beside-source mode must invalidate the old plan.'
+            foreach ($control in $outputControls) { & $assert (-not $control.Visible) 'Separate-output controls must be hidden in beside-source mode.' }
+            $find.PerformClick()
+            & $assert ($providerCalls.DestinationRoot -eq $providerCalls.SourceRoot) 'Beside-source search must use the source as the destination.'
+            & $assert ($state.Grid.Rows.Count -eq 20) 'Beside-source mode must support refinding the acts.'
+            $beside.Checked = $false
+            & $assert ($state.Grid.Rows.Count -eq 0 -and -not $state.Form.AcceptButton.Enabled) 'Restoring separate-output mode must invalidate the old plan.'
+            foreach ($control in $outputControls) { & $assert $control.Visible 'Separate-output controls must reappear after restoring the mode.' }
+            & $assert ($output.Text -eq $priorOutput) 'The prior separate-output path must survive a mode round trip.'
+            & $assert $output.Enabled 'Restored separate-output field must be editable.'
+            $find.PerformClick()
+            & $assert ($providerCalls.DestinationRoot -eq $priorOutput) 'Refind must use the restored separate-output path.'
+            & $assert ($state.Grid.Rows.Count -eq 20) 'Restored separate-output mode must support refinding.'
             $grid = $state.Grid
             & $assert ($state.Form.AcceptButton.Enabled) 'Signing plan action must be enabled for a single synthetic cert and new acts.'
             $newRows = @($grid.Rows | Where-Object { [bool]$_.Cells[0].Value })
@@ -157,6 +260,18 @@ $timer.Add_Tick({
             $timer.Stop()
             $state.Form.AcceptButton.PerformClick()
         }
+        if ($state.Phase -eq 10) {
+            $forms = @([System.Windows.Forms.Application]::OpenForms)
+            if ($forms.Count -eq 0) { return }
+            $state.Form = $forms[0]
+            $state.Controls = @(& $walk $state.Form)
+            $state.Phase = 11
+            & $assert (-not $state.Form.AcceptButton.Enabled) 'A certificate read failure must leave signing unavailable.'
+            & $inspectDetails $true
+            $state.Phase = 12
+            $timer.Stop()
+            $state.Form.CancelButton.PerformClick()
+        }
     }
     catch {
         $state.Error = $_.Exception.ToString()
@@ -178,7 +293,16 @@ try {
         & $assert ([object]::ReferenceEquals($result.Plan.Items[1], $items[7])) 'Returned second act must map to the row Tag.'
         & $assert ([object]::ReferenceEquals($result.CertificateInfo, $certificate)) 'Returned certificate must be the synthetic selection.'
         & $assert ([bool]$result.CopyOriginals) 'Separate-output choice must remain in the returned plan.'
+        & $assert ($result.Plan.OutputRoot -eq 'C:\SyntheticPreviousOutput') 'The returned plan must retain the restored separate-output path.'
     }
+    # Exercise diagnostic failure only after completing the selected-plan assertions.
+    $state.Phase = 10; $state.Form = $null; $state.Error = $null; $state.Started = [datetime]::UtcNow
+    $failedCertificateProvider = { throw $syntheticReadError }.GetNewClosure()
+    $timer.Start()
+    $failureResult = Show-ActSignerWindow -CertificateProvider $failedCertificateProvider -PlanProvider $planProvider
+    if ($null -ne $state.Error) { throw $state.Error }
+    & $assert ($state.Phase -eq 12) 'Certificate read failure diagnostic scenario must complete.'
+    & $assert ($null -eq $failureResult) 'Cancelling the diagnostic scenario must not return a signing plan.'
 }
 catch { $failures.Add($_.Exception.Message) }
 finally {
@@ -189,4 +313,4 @@ finally {
 }
 foreach ($measurement in $measurements) { Write-Host ('MEASURE {0}: grid={1}x{2}, visible body={3}px, complete rows={4}' -f $measurement.Name, $measurement.GridWidth, $measurement.GridHeight, $measurement.VisibleBodyHeight, $measurement.FullyVisibleRows) }
 if ($failures.Count -gt 0) { throw ('UI regression check failed:' + [Environment]::NewLine + ($failures.ToArray() -join [Environment]::NewLine)) }
-Write-Host 'PASS: native Windows layout, checkbox counts, existing-signature protection, and selected plan mapping.'
+Write-Host 'PASS: native Windows layout, checkbox counts, selected plan mapping, output mode round trip, and certificate dialogs/diagnostic failure.'
