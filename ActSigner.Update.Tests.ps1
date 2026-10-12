@@ -214,7 +214,7 @@ try {
             Assert-Update ($redirected.Status -eq 'unavailable') 'Linked state directory was followed.'
             Assert-Update (@(Get-ChildItem -LiteralPath $external -Force).Count -eq 1) 'Linked state directory caused external writes.'
         }
-        finally { Remove-Item -LiteralPath $linkedState -Force }
+        finally { [IO.Directory]::Delete($linkedState) }
         Write-Host 'PASS: state ancestor reparse rejection'
     }
     # A task that ignores cancellation must still stop at the wall-clock deadline.
