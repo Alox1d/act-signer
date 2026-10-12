@@ -5,6 +5,7 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $session = $null
+$consoleState = $null
 $exitCode = 0
 try {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
@@ -16,8 +17,10 @@ try {
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
         throw 'Запустите Start.cmd: для окна выбора нужен режим STA.'
     }
+    Import-Module (Join-Path $PSScriptRoot 'ActSigner.Console.psm1') -Force -DisableNameChecking
+    $consoleState = Disable-ActConsoleQuickEdit
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
-    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.3' } catch { }
+    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.3.1' } catch { }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -103,6 +106,11 @@ catch {
     Write-Host 'Скопируйте текст ошибки, если нужна помощь. PIN и закрытый ключ сообщать не нужно.'
 }
 finally {
-    if ($null -ne $session) { Close-ActCryptoSession -Session $session }
+    try {
+        if ($null -ne $session) { Close-ActCryptoSession -Session $session }
+    }
+    finally {
+        if ($null -ne $consoleState) { Restore-ActConsoleQuickEdit -State $consoleState }
+    }
 }
 exit $exitCode
