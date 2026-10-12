@@ -4,7 +4,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-$session = $null
+$signingState = @{ Session = $null }
 $consoleState = $null
 $exitCode = 0
 try {
@@ -20,7 +20,7 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'ActSigner.Console.psm1') -Force -DisableNameChecking
     $consoleState = Disable-ActConsoleQuickEdit
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
-    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.3.1' } catch { }
+    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.4' } catch { }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -54,20 +54,31 @@ try {
         Write-Host ('Результат: {0}' -f $selection.Plan.OutputRoot)
         Write-Host 'PIN вводите только в штатном окне КриптоПро или токена.'
         Write-Host 'Отмена запроса PIN остановит пакет. Уже готовые подписи сохранятся.'
+        Write-Host 'Сначала проверяем подписи рядом с актом. Повторную подпись тем же сертификатом пропускаем.'
         Write-Host ''
 
-        $session = New-ActCryptoSession -CertificateInfo $certificate
         $signBlock = {
             param([byte[]]$PdfBytes)
-            Invoke-ActCryptoSign -Session $session -PdfBytes $PdfBytes
+            if ($null -eq $signingState.Session) {
+                $signingState.Session = New-ActCryptoSession -CertificateInfo $certificate
+            }
+            Invoke-ActCryptoSign -Session $signingState.Session -PdfBytes $PdfBytes
         }.GetNewClosure()
+        $existingSignatureInspector = {
+            param([byte[]]$PdfBytes, [byte[]]$SignatureBytes)
+            Get-ActExistingSignatureInfo -PdfBytes $PdfBytes -SignatureBytes $SignatureBytes
+        }
         $verifyBlock = {
             param([byte[]]$PdfBytes, [byte[]]$SignatureBytes, [string]$Thumbprint)
             Test-ActCryptoSignature -PdfBytes $PdfBytes -SignatureBytes $SignatureBytes -Thumbprint $Thumbprint
         }
         $progressBlock = {
             param($Event)
-            if ($Event.Status -eq 'signing') {
+            if ($Event.Status -eq 'checking_existing') {
+                Write-Host ('[{0}/{1}] {2}' -f $Event.Index, $Event.Total, $Event.Item.RelativePath)
+                Write-Host ('  ' + $Event.Message)
+            }
+            elseif ($Event.Status -eq 'signing') {
                 Write-Host ('[{0}/{1}] {2}' -f $Event.Index, $Event.Total, $Event.Item.RelativePath)
             }
             elseif ($Event.Status -eq 'signed_verified') {
@@ -76,17 +87,21 @@ try {
             elseif ($Event.Status -eq 'error') {
                 Write-Host ('  Ошибка: {0}' -f $Event.Message) -ForegroundColor Red
             }
+            elseif ($Event.Status -eq 'already_signed') {
+                Write-Host ('  Пропущен: ' + $Event.Message) -ForegroundColor Cyan
+            }
             elseif ($Event.Status -eq 'exists_unverified') {
                 Write-Host ('  Пропущен готовый файл: {0}' -f $Event.Item.RelativePath)
             }
         }
         $logRoot = Join-Path $selection.Plan.OutputRoot '_ActSigner_logs'
         $result = Invoke-ActBatch -Plan $selection.Plan -Thumbprint $certificate.Thumbprint `
-            -SignBlock $signBlock -VerifyBlock $verifyBlock -LogRoot $logRoot `
+            -SignBlock $signBlock -VerifyBlock $verifyBlock -ExistingSignatureInspector $existingSignatureInspector -LogRoot $logRoot `
             -CopyOriginals:([bool]$selection.CopyOriginals) -OnProgress $progressBlock
         Write-Host ''
         Write-Host ('Создано и проверено: {0}' -f $result.CompletedCount)
-        Write-Host ('Пропущено существующих: {0}' -f $result.SkippedCount)
+        Write-Host ('Пропущено всего: {0}' -f $result.SkippedCount)
+        Write-Host ('Уже подписано выбранным сертификатом: {0}' -f $result.AlreadySignedCount)
         Write-Host ('Ошибок: {0}; не обработано: {1}' -f $result.ErrorCount, $result.NotProcessedCount)
         Write-Host ('Журнал: {0}' -f $result.LogPath)
         if ($result.Stopped) {
@@ -95,7 +110,8 @@ try {
             Write-Host 'После устранения причины запустите программу снова: готовые подписи не перезаписываются.'
         }
         else {
-            Write-Host ('Готово. Файлы находятся в: {0}' -f $selection.Plan.OutputRoot) -ForegroundColor Green
+            Write-Host ('Обработка завершена. Новых подписей: {0}; пропущено: {1}.' -f $result.CompletedCount, $result.SkippedCount) -ForegroundColor Green
+            if ($result.CompletedCount -gt 0) { Write-Host ('Новые файлы: {0}' -f $selection.Plan.OutputRoot) }
         }
     }
 }
@@ -107,7 +123,7 @@ catch {
 }
 finally {
     try {
-        if ($null -ne $session) { Close-ActCryptoSession -Session $session }
+        if ($null -ne $signingState.Session) { Close-ActCryptoSession -Session $signingState.Session }
     }
     finally {
         if ($null -ne $consoleState) { Restore-ActConsoleQuickEdit -State $consoleState }

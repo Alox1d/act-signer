@@ -31,3 +31,7 @@ TestResults/
 
 # Synthetic screenshots and local UI measurements
 ui-test-artifacts/
+
+# Synthetic native-console regression reports
+console-test-artifacts/
+entry-test-artifacts/

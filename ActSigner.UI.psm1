@@ -110,7 +110,7 @@ function Show-ActSignerWindow {
     $form = New-Object System.Windows.Forms.Form
     $ui.Form = $form
     $form.SuspendLayout()
-    $form.Text = 'Подписание актов 1.3'
+    $form.Text = 'Подписание актов 1.4'
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.Font = $baseFont
     $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
@@ -750,6 +750,9 @@ function Show-ActSignerWindow {
                     if ($null -eq $item) { continue }
                     $existing = [bool]$item.ExistingSignature
                     $status = 'Новая подпись'
+                    $neighborCount = 0
+                    if ($null -ne $item.PSObject.Properties['NeighborSignatureCount']) { $neighborCount = [int]$item.NeighborSignatureCount }
+                    if ($neighborCount -gt 0) { $status = 'Подписей рядом: ' + $neighborCount }
                     if ($existing) { $status = 'Подпись уже есть' }
                     $rowIndex = $ui.Grid.Rows.Add([object[]]@((-not $existing), [string]$item.RelativePath, $status))
                     $row = $ui.Grid.Rows[$rowIndex]
@@ -757,6 +760,9 @@ function Show-ActSignerWindow {
                     $row.Cells[0].ReadOnly = $existing
                     $row.Cells[1].ToolTipText = 'Исходный PDF: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
                     $row.Cells[2].ToolTipText = [string]$item.SignaturePath
+                    if (-not $existing -and $neighborCount -gt 0) {
+                        $row.Cells[2].ToolTipText = 'Перед подписанием проверим соседние файлы. Если этот PDF уже подписан выбранным сертификатом, повторной подписи не будет.'
+                    }
                     if ($existing) {
                         $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText
                         $row.Cells[0].ToolTipText = 'Существующие .my.sig не перезаписываются.'

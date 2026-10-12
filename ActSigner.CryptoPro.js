@@ -285,6 +285,40 @@
         return actual;
     }
 
+    function inspect(request) {
+        stage = "SignedData.Create";
+        var data = new ActiveXObject("CAdESCOM.CadesSignedData");
+        data.ContentEncoding = 1;
+        data.Content = request.pdf;
+        try {
+            stage = "SignedData.VerifyCades";
+            // Accept existing PKCS7/CMS/CAdES without requiring a newly made BES.
+            // All signatures are verified before any identity is returned.
+            data.VerifyCades(request.signature, 65535, true);
+            stage = "SignedData.Content";
+            // Enforce exact external-content binding, including implementations
+            // which return embedded content when given an attached CMS.
+            var content = exportedBlob(data.Content, MAX_BYTES);
+            check(content.base64 === request.pdf, "CONTENT_BINDING");
+            stage = "Signers.Count";
+            var signers = data.Signers;
+            var count = signers.Count;
+            check(typeof count === "number" && isFinite(count) && count >= 1 && count === Math.floor(count) && count <= MAX_RECORDS, "SIGNER_COUNT");
+            var thumbprints = [];
+            for (var i = 1; i <= count; i++) {
+                stage = "Signer.Thumbprint";
+                thumbprints.push(normalizedThumbprint(signers.Item(i).Certificate.Thumbprint));
+            }
+            return { status: "valid", thumbprints: thumbprints, detail: null };
+        } catch (inspectionError) {
+            var detail = safeError(inspectionError);
+            // Only the explicit content-hash mismatch is an unrelated document.
+            // Malformed, unsupported, trust and all other failures stay unresolved.
+            var mismatch = detail.stage === "SignedData.VerifyCades" && detail.code === "NATIVE" && detail.hr === "0x80091007";
+            return { status: mismatch ? "different_content" : "unverifiable", thumbprints: [], detail: detail };
+        }
+    }
+
     function preflight() {
         stage = "Store.Create";
         var store = new ActiveXObject("CAdESCOM.Store");
@@ -311,12 +345,12 @@
         var id = readLine(32);
         check(/^[0-9a-f]{32}$/.test(id), "PROTOCOL");
         var command = readLine(16);
-        check(/^(CHECK|DISCOVER|SELECT|SIGN|VERIFY|CLOSE)$/.test(command), "PROTOCOL");
+        check(/^(CHECK|DISCOVER|SELECT|SIGN|VERIFY|INSPECT|CLOSE)$/.test(command), "PROTOCOL");
         var request = { id: id, command: command };
         if (command === "SELECT" || command === "SIGN") { request.kind = inputKind(); request.thumb = inputThumbprint(); }
         if (command === "VERIFY") request.thumb = inputThumbprint();
-        if (command === "SIGN" || command === "VERIFY") request.pdf = inputBlob();
-        if (command === "VERIFY") request.signature = inputBlob();
+        if (command === "SIGN" || command === "VERIFY" || command === "INSPECT") request.pdf = inputBlob();
+        if (command === "VERIFY" || command === "INSPECT") request.signature = inputBlob();
         check(readLine(3) === "END", "PROTOCOL");
         return request;
     }
@@ -373,6 +407,17 @@
                         beginResponse(request, "OK");
                         line(1);
                         line(thumb);
+                    } else if (command === "INSPECT") {
+                        var inspection = inspect(request);
+                        beginResponse(request, "OK");
+                        line(inspection.status);
+                        line(inspection.thumbprints.length);
+                        for (var t = 0; t < inspection.thumbprints.length; t++) line(inspection.thumbprints[t]);
+                        if (inspection.detail !== null) {
+                            line(inspection.detail.stage);
+                            line(inspection.detail.code);
+                            line(inspection.detail.hr);
+                        }
                     }
                 }
                 endResponse();
