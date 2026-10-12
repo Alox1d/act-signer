@@ -1,23 +1,30 @@
 # User documents and electronic signatures
-*.pdf
-*.sig
-*.p7s
-*.p7m
+*.[pP][dD][fF]
+*.[sS][iI][gG]
+*.[sS][gG][nN]
+*.[pP]7[sSmM]
 Подписанные_акты/
 
-# Batch logs, temporary files and packaged results
-_ActSigner_logs/
-*.log
-*.csv
-*.tmp
-*.zip
-TestResults/
+# Private keys, certificate exports and CSP registry backups
+*.[pP][fF][xX]
+*.[pP]12
+*.[kK][eE][yY]
+*.[pP][eE][mM]
+*.[dD][eE][rR]
+*.[cC][eE][rR]
+*.[cC][rR][tT]
+*.[pP]7[bBcC]
+*.[sS][sS][tT]
+*.[rR][eE][gG]
 
-# Per-user preferences; the application uses LocalAppData
+# Local settings, reports and packaged results
+.[eE][nN][vV]
+.[eE][nN][vV].*
 settings.json
-
-# Diagnostic output and private-key export files
-ActSigner-diagnostics.txt
-*.pfx
-*.p12
-*.key
+ActSigner-diagnostics*.txt
+_ActSigner_logs/
+*.[lL][oO][gG]
+*.[cC][sS][vV]
+*.[tT][mM][pP]
+*.[zZ][iI][pP]
+TestResults/

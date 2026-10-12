@@ -17,7 +17,7 @@ try {
         throw 'Запустите Start.cmd: для окна выбора нужен режим STA.'
     }
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
-    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.1' } catch { }
+    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро 1.2' } catch { }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()

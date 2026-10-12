@@ -1,324 +1,385 @@
 ﻿#requires -Version 5.1
-<#
-Managed regression tests for the PowerShell reflection helpers and discovery
-error reporting. These tests do not load CryptoPro, use COM, read a certificate
-store, access a token, or create/verify an electronic signature.
-
-Run with Windows PowerShell 5.1 or PowerShell 7:
-  powershell.exe -NoProfile -File .\ActSigner.CryptoPro.Tests.ps1
-
-Passing on Linux verifies managed argument/collection behavior only. Windows
-PowerShell 5.1 with the actual CAdESCOM runtime still needs an integration check.
-#>
-
-[CmdletBinding()]
-param()
-
+# Protocol and managed/JavaScript mocks. These tests do not use real CryptoPro,
+# Windows COM, a token, a user certificate or a PIN, and do not prove native signing.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+Import-Module (Join-Path $PSScriptRoot 'ActSigner.CryptoPro.psm1') -Force
+$module = Get-Module ActSigner.CryptoPro
 
-if (-not ('ActSignerManagedTests.Collection' -as [type])) {
-    Add-Type -TypeDefinition @'
+function Assert-BridgeTest {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw ('ASSERT: ' + $Message) }
+}
+
+& $module {
+    Initialize-ActBridgeTransport
+    function Assert-Case {
+        param([bool]$Condition, [string]$Message)
+        if (-not $Condition) { throw ('ASSERT: ' + $Message) }
+    }
+    function Must-Fail {
+        param([scriptblock]$Action, [string]$Message)
+        $failed = $false
+        try { & $Action | Out-Null } catch { $failed = $true }
+        Assert-Case $failed $Message
+    }
+    function Make-Frame {
+        param([string]$Command, [string[]]$Payload)
+        return ,([string[]](@('ACTSIGNER/1', ('0' * 32), 'OK', $Command) + $Payload + @('END')))
+    }
+
+    if (-not ('ActSignerTests.BridgeFake' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
 using System;
-using System.Collections;
-using System.Collections.Generic;
-
-namespace ActSignerManagedTests
-{
-    public sealed class Collection : IEnumerable
-    {
-        private readonly object[] items;
-        public Collection(object[] items) { this.items = items; FindResult = this; }
-        public bool ThrowOnEnumeration { get; set; }
-        public bool ThrowOnCount { get; set; }
-        public int EnumerationCalls { get; private set; }
-        public int LastIndex { get; private set; }
-        public int FindCalls { get; private set; }
-        public int LastFindType { get; private set; }
-        public string LastThumbprint { get; private set; }
-        public bool LastValidOnly { get; private set; }
-        public Collection FindResult { get; set; }
-        public int Count
-        {
-            get
-            {
-                if (ThrowOnCount) throw new NullReferenceException("Injected Count failure.");
-                return items.Length;
-            }
+using System.IO;
+namespace ActSignerTests {
+    public sealed class BridgeFake : IDisposable {
+        public string[] Reply;
+        public bool IsClosed;
+        public bool Finished;
+        public bool ThrowOnExchange;
+        public bool ThrowOnFinish;
+        public int Calls;
+        public string Command;
+        public int Kind;
+        public string Thumb;
+        public byte[] Pdf;
+        public byte[] Signature;
+        public string[] Exchange(string command, int kind, string thumb, byte[] pdf, byte[] signature, int timeout, int maximum) {
+            Calls++; Command = command; Kind = kind; Thumb = thumb; Pdf = pdf; Signature = signature;
+            if (ThrowOnExchange) throw new IOException("UNSAFE_PROVIDER_DETAIL");
+            return Reply;
         }
-        public object this[int index]
-        {
-            get
-            {
-                LastIndex = index;
-                if (index < 1 || index > items.Length)
-                    throw new ArgumentOutOfRangeException("index");
-                return items[index - 1];
-            }
+        public void Finish(int timeout) {
+            Finished = true;
+            if (ThrowOnFinish) throw new IOException("UNSAFE_PROVIDER_DETAIL");
         }
-        public Collection Find(int findType, string thumbprint, bool validOnly)
-        {
-            FindCalls++;
-            LastFindType = findType;
-            LastThumbprint = thumbprint;
-            LastValidOnly = validOnly;
-            return FindResult;
-        }
-        public IEnumerator GetEnumerator()
-        {
-            EnumerationCalls++;
-            if (ThrowOnEnumeration)
-                throw new InvalidOperationException("The helper enumerated the collection.");
-            return items.GetEnumerator();
-        }
-    }
-
-    public sealed class MemberFixture
-    {
-        public object Certificate { get; set; }
-        public Collection Certificates { get; set; }
-        public object[] ArrayProperty { get; set; }
-        public bool Flag { get; set; }
-        public int Number { get; set; }
-        public string Text { get; set; }
-        public DateTime Timestamp { get; set; }
-        public int VoidCalls { get; private set; }
-        public int AddCalls { get; private set; }
-        public object AddedObject { get; private set; }
-        public object[] CapturedArguments { get; private set; }
-        public void Void() { VoidCalls++; }
-        public void Add(object value) { AddCalls++; AddedObject = value; }
-        public object Echo(object value) { return value; }
-        public object ReturnNull() { return null; }
-        public object[] ReturnArray() { return ArrayProperty; }
-        public void Capture(object nullable, bool flag, int number, string text, object[] array)
-        {
-            CapturedArguments = new object[] { nullable, flag, number, text, array };
-        }
-    }
-
-    public sealed class Store
-    {
-        private readonly Collection certificates;
-        public Store(Collection certificates) { this.certificates = certificates; }
-        public string FailureStage { get; set; }
-        public int OpenCalls { get; private set; }
-        public int CloseCalls { get; private set; }
-        public int OpenKind { get; private set; }
-        public string OpenName { get; private set; }
-        public int OpenFlags { get; private set; }
-        public void Open(int kind, string name, int flags)
-        {
-            OpenCalls++;
-            OpenKind = kind;
-            OpenName = name;
-            OpenFlags = flags;
-            if (FailureStage == "Store.Open")
-                throw new NullReferenceException("Injected Open failure.");
-        }
-        public Collection Certificates
-        {
-            get
-            {
-                if (FailureStage == "Store.Certificates")
-                    throw new NullReferenceException("Injected Certificates failure.");
-                return certificates;
-            }
-        }
-        public void Close() { CloseCalls++; }
-    }
-
-    public static class StoreFactory
-    {
-        public static readonly Queue<Store> Stores = new Queue<Store>();
-        public static int CreateCalls;
-        public static Store Next()
-        {
-            CreateCalls++;
-            if (Stores.Count == 0)
-                throw new InvalidOperationException("Unexpected extra store creation.");
-            return Stores.Dequeue();
-        }
-        public static void Reset() { Stores.Clear(); CreateCalls = 0; }
+        public void Dispose() { IsClosed = true; }
     }
 }
 '@
-}
-
-Import-Module (Join-Path $PSScriptRoot 'ActSigner.CryptoPro.psm1') -Force -DisableNameChecking
-$cryptoModule = Get-Module ActSigner.CryptoPro
-if ($null -eq $cryptoModule) { throw 'The CryptoPro module did not load.' }
-
-# Execute assertions inside the module to access its private helpers. Do not
-# reimplement the helpers in this test file.
-& $cryptoModule {
-    $testCount = 0
-
-    function Assert-Managed {
-        param([bool]$Condition, [string]$Message)
-        if (-not $Condition) { throw ('ASSERTION FAILED: ' + $Message) }
     }
 
-    $fixture = [ActSignerManagedTests.MemberFixture]::new()
-    $first = [object]::new()
-    $second = [object]::new()
-    $third = [object]::new()
+    $separator = [IO.Path]::DirectorySeparatorChar
+    Assert-Case ((Get-ActCScriptPath 'WindowsRoot' $true $false).EndsWith(('Sysnative' + $separator + 'cscript.exe'))) '32-on-64 must use Sysnative.'
+    Assert-Case ((Get-ActCScriptPath 'WindowsRoot' $true $true).EndsWith(('System32' + $separator + 'cscript.exe'))) 'Native 64-bit must use System32.'
+    Assert-Case ((Get-ActCScriptPath 'WindowsRoot' $false $false).EndsWith(('System32' + $separator + 'cscript.exe'))) '32-bit Windows must use System32.'
+    Assert-Case ([ActSigner.CScriptTransport]::QuoteArgument('') -ceq '""') 'Empty argument quoting.'
+    Assert-Case ([ActSigner.CScriptTransport]::QuoteArgument('a"b\') -ceq '"a\"b\\"') 'Quote and trailing backslash escaping.'
+    Assert-Case ([ActSigner.CScriptTransport]::QuoteArgument('Каталог & [1]') -ceq '"Каталог & [1]"') 'Unicode and shell characters must stay one literal argument.'
 
-    foreach ($size in @(0, 1, 3)) {
-        $items = [Array]::CreateInstance([object], $size)
-        if ($size -gt 0) { $items[0] = $first }
-        if ($size -gt 1) { $items[1] = $second; $items[2] = $third }
-        $collection = [ActSignerManagedTests.Collection]::new($items)
-        $collection.ThrowOnEnumeration = $true
-        $fixture.Certificates = $collection
+    $index = 0
+    $bytes = Read-ActBridgeBlob @('3', 'YWJj') ([ref]$index)
+    Assert-Case ($bytes -is [byte[]] -and [Text.Encoding]::ASCII.GetString($bytes) -ceq 'abc' -and $index -eq 2) 'Exact byte[] protocol decoding.'
+    $large = New-Object byte[] 73731
+    for ($i = 0; $i -lt $large.Length; $i++) { $large[$i] = [byte]($i % 251) }
+    $base64 = [Convert]::ToBase64String($large)
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    $parts.Add([string]$large.Length)
+    for ($i = 0; $i -lt $base64.Length; $i += 49152) { $parts.Add($base64.Substring($i, [Math]::Min(49152, $base64.Length - $i))) }
+    $index = 0
+    $decoded = Read-ActBridgeBlob $parts.ToArray() ([ref]$index)
+    Assert-Case ([Convert]::ToBase64String($decoded) -ceq $base64) 'Chunk boundaries changed snapshot bytes.'
+    Must-Fail { $index = 0; Read-ActBridgeBlob @('0') ([ref]$index) } 'Empty binary must fail.'
+    Must-Fail { $index = 0; Read-ActBridgeBlob @('67108865') ([ref]$index) } 'Oversized advertised binary must fail before allocation.'
+    Must-Fail { $index = 0; Read-ActBridgeBlob @('1', 'Zh==') ([ref]$index) } 'Noncanonical padding bits must fail.'
+    Must-Fail { $index = 0; Read-ActBridgeBlob @('2', 'YWJj') ([ref]$index) } 'Declared byte length mismatch must fail.'
+    Must-Fail { $index = 0; Read-ActBridgeBlob @('3', 'YW J') ([ref]$index) } 'Whitespace in payload must fail.'
+    Must-Fail { Assert-ActBridgeEnd @('extra') 0 } 'Trailing fields must fail.'
+    Must-Fail { ConvertFrom-ActBridgeCertificate 2 ('A' * 40) ([byte[]]@(1, 2, 3)) } 'Non-certificate data must not enter X509 metadata.'
+    Must-Fail { Get-ActNormalizedThumbprint 'not-a-thumbprint' } 'Invalid thumbprint must fail.'
 
-        $result = Get-ActComProperty $fixture 'Certificates'
-        Assert-Managed ([object]::ReferenceEquals($collection, $result)) "Property preserves the $size-item collection object."
-        Assert-Managed ($collection.EnumerationCalls -eq 0) 'Property must not invoke IEnumerable.GetEnumerator.'
-        Assert-Managed ((Get-ActComProperty $result 'Count') -eq $size) 'Count remains accessible through the returned collection.'
+    $thumb = 'A' * 40
+    [byte[]]$snapshot = @(0, 255, 1, 128, 10)
+    $fake = New-Object ActSignerTests.BridgeFake
+    $fake.Reply = Make-Frame 'SIGN' @('3', 'YWJj')
+    $session = [pscustomobject]@{ Transport = $fake; Store = $null; Certificate = $null; Thumbprint = $thumb; StoreKind = 100; Closed = $false }
+    $signature = Invoke-ActCryptoSign $session $snapshot
+    Assert-Case ($signature -is [byte[]] -and [Text.Encoding]::ASCII.GetString($signature) -ceq 'abc') 'Sign API must return one byte[] value.'
+    Assert-Case ([Object]::ReferenceEquals($fake.Pdf, $snapshot)) 'Sign must submit the supplied snapshot, not reread a path.'
+    Assert-Case ($fake.Kind -eq 100 -and $fake.Thumb -ceq $thumb -and $fake.Command -ceq 'SIGN') 'Selected source and thumbprint were not submitted.'
+    $fake.Reply = Make-Frame 'SIGN' @('3', 'YWJj', 'EXTRA')
+    Must-Fail { Invoke-ActCryptoSign $session $snapshot } 'Malformed signature response must fail.'
+    Assert-Case ($session.Closed -and $fake.IsClosed) 'A malformed sign response must close the session.'
+    $calls = $fake.Calls
+    Must-Fail { Invoke-ActCryptoSign $session $snapshot } 'Closed sessions must not retry signing.'
+    Assert-Case ($fake.Calls -eq $calls) 'Closed session sent an extra signing command.'
 
-        # Capture the helper's pipeline output too: exactly one collection,
-        # including when that collection itself has zero elements.
-        $outputItems = @(Get-ActComProperty $fixture 'Certificates')
-        Assert-Managed ($outputItems.Count -eq 1) 'Property emits exactly one object.'
-        Assert-Managed ([object]::ReferenceEquals($collection, $outputItems[0])) 'Pipeline output contains the collection itself.'
-
-        $found = Invoke-ActComMethod $collection 'Find' @([int]0, 'TEST-THUMBPRINT', $false)
-        Assert-Managed ([object]::ReferenceEquals($collection, $found)) "Find preserves the $size-item collection object."
-        Assert-Managed ($collection.EnumerationCalls -eq 0) 'Find must not enumerate its return value.'
-        Assert-Managed ($collection.FindCalls -eq 1) 'Find is called exactly once.'
-        Assert-Managed ($collection.LastFindType -eq 0 -and $collection.LastThumbprint -eq 'TEST-THUMBPRINT' -and -not $collection.LastValidOnly) 'Find receives int/string/bool values without coercion or reordering.'
-
-        if ($size -gt 0) {
-            $item = Get-ActComProperty $found 'Item' @([int]1)
-            Assert-Managed ([object]::ReferenceEquals($first, $item)) 'Indexed Item returns the original first element.'
-            Assert-Managed ($collection.LastIndex -eq 1) 'Indexed Item uses the original one-based index.'
-            if ($size -eq 3) {
-                $item = Get-ActComProperty $found 'Item' @([int]3)
-                Assert-Managed ([object]::ReferenceEquals($third, $item)) 'Indexed Item can retrieve the final element.'
-            }
-        }
-        $testCount++
-        Write-Host "PASS collection property/Find/Item: size $size"
-    }
-
-    # SetProperty's @(,$Value) must supply one argument, not wrap the actual
-    # object in another array, even when the object itself is enumerable.
-    foreach ($value in @($first, $collection)) {
-        $setterOutput = @(Set-ActComProperty $fixture 'Certificate' $value)
-        Assert-Managed ($setterOutput.Count -eq 0) 'A property setter does not emit output.'
-        Assert-Managed ([object]::ReferenceEquals($value, $fixture.Certificate)) 'Object setter preserves reference identity without an array wrapper.'
-    }
-
-    $payload = [object[]]@($first, [int]7, 'payload')
-    Set-ActComProperty $fixture 'Certificate' $payload
-    Assert-Managed ([object]::ReferenceEquals($payload, $fixture.Certificate)) 'Object setter preserves an object[] value as one argument.'
-    Set-ActComProperty $fixture 'ArrayProperty' $payload
-    Assert-Managed ([object]::ReferenceEquals($payload, $fixture.ArrayProperty)) 'Array-typed setter preserves the original array.'
-    Set-ActComProperty $fixture 'Certificate' $null
-    Assert-Managed ($null -eq $fixture.Certificate) 'Object setter accepts an explicit null.'
-    Set-ActComProperty $fixture 'Flag' $false
-    Set-ActComProperty $fixture 'Number' ([int]0)
-    Set-ActComProperty $fixture 'Text' ''
-    $date = [DateTime]::new(2026, 10, 12, 1, 2, 3)
-    Set-ActComProperty $fixture 'Timestamp' $date
-    Assert-Managed (-not $fixture.Flag -and $fixture.Number -eq 0 -and $fixture.Text -ceq '') 'False/zero/empty string setters do not lose values.'
-    Assert-Managed ($fixture.Timestamp -eq $date) 'DateTime setter preserves the date value.'
-    $testCount++
-    Write-Host 'PASS property setters: references, arrays, null, scalar values, DateTime'
-
-    # Use the exact Add call-site argument packaging present in the application.
-    foreach ($attribute in @($first, $collection)) {
-        $voidResult = Invoke-ActComMethod $fixture 'Add' @(,$attribute)
-        Assert-Managed ($null -eq $voidResult) 'Void Add returns null.'
-        Assert-Managed ([object]::ReferenceEquals($attribute, $fixture.AddedObject)) 'Add receives the object itself, not a one-element wrapper array.'
-    }
-    $voidResult = Invoke-ActComMethod $fixture 'Add' @(,$payload)
-    Assert-Managed ([object]::ReferenceEquals($payload, $fixture.AddedObject)) 'Add can receive an array as its one object argument.'
-    $voidResult = Invoke-ActComMethod $fixture 'Add' @(,$null)
-    Assert-Managed ($null -eq $fixture.AddedObject) 'Add accepts an explicit single null argument.'
-    Assert-Managed ($fixture.AddCalls -eq 4) 'Each Add call executes once.'
-    $voidResult = Invoke-ActComMethod $fixture 'Void'
-    Assert-Managed ($fixture.VoidCalls -eq 1 -and $null -eq $voidResult) 'Zero-argument void method executes once.'
-    $testCount++
-    Write-Host 'PASS void methods and single-object Add arguments'
-
-    $mixedArguments = [Array]::CreateInstance([object], 5)
-    $mixedArguments[0] = $null
-    $mixedArguments[1] = $true
-    $mixedArguments[2] = [int]42
-    $mixedArguments[3] = 'A&B (test)'
-    $mixedArguments[4] = $payload
-    [void](Invoke-ActComMethod $fixture 'Capture' $mixedArguments)
-    Assert-Managed ($fixture.CapturedArguments.Length -eq 5) 'Mixed argument count is preserved.'
-    Assert-Managed ($null -eq $fixture.CapturedArguments[0]) 'Null argument position is preserved.'
-    Assert-Managed ($fixture.CapturedArguments[1] -is [bool] -and $fixture.CapturedArguments[1]) 'Boolean argument type/value is preserved.'
-    Assert-Managed ($fixture.CapturedArguments[2] -is [int] -and $fixture.CapturedArguments[2] -eq 42) 'Integer argument type/value is preserved.'
-    Assert-Managed ($fixture.CapturedArguments[3] -ceq 'A&B (test)') 'String content is preserved.'
-    Assert-Managed ([object]::ReferenceEquals($payload, $fixture.CapturedArguments[4])) 'Nested array argument preserves its identity and position.'
-    $echo = Invoke-ActComMethod $fixture 'Echo' @(,$collection)
-    Assert-Managed ([object]::ReferenceEquals($collection, $echo)) 'Method returning object preserves an IEnumerable instance.'
-    $nullResult = Invoke-ActComMethod $fixture 'ReturnNull'
-    Assert-Managed ($null -eq $nullResult) 'Null method result remains null.'
-    foreach ($arraySize in @(0, 1, 3)) {
-        $returnedArray = [Array]::CreateInstance([object], $arraySize)
-        if ($arraySize -gt 0) { $returnedArray[0] = $first }
-        $fixture.ArrayProperty = $returnedArray
-        $fromProperty = Get-ActComProperty $fixture 'ArrayProperty'
-        $fromMethod = Invoke-ActComMethod $fixture 'ReturnArray'
-        Assert-Managed ([object]::ReferenceEquals($returnedArray, $fromProperty)) 'Array property is not flattened or copied.'
-        Assert-Managed ([object]::ReferenceEquals($returnedArray, $fromMethod)) 'Array method result is not flattened or copied.'
-    }
-    $testCount++
-    Write-Host 'PASS argument types/positions and null/array method results'
-
-    # Exercise the real discovery function with managed stores that fail at
-    # each outer stage. No fake signatures, user certificates or private keys.
-    $originalFactory = (Get-Item Function:New-ActComObject).ScriptBlock
+    $savedFactory = (Get-Item Function:New-ActBridgeTransport).ScriptBlock
     try {
-        Set-Item Function:script:New-ActComObject -Value {
-            param([string]$ProgId)
-            if ($ProgId -ne 'CAdESCOM.Store') { throw 'Unexpected test ProgID.' }
-            $store = [ActSignerManagedTests.StoreFactory]::Next()
-            return ,$store
+        Set-Item Function:script:New-ActBridgeTransport -Value { return $script:ActTestTransport }
+        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+        $script:ActTestTransport.Reply = Make-Frame 'VERIFY' @('1', $thumb)
+        Test-ActCryptoSignature $snapshot ([byte[]]@(1, 2, 3)) $thumb
+        Assert-Case ($script:ActTestTransport.Command -ceq 'VERIFY' -and $script:ActTestTransport.Finished -and $script:ActTestTransport.IsClosed) 'Verify must use and cleanly finish its separate worker.'
+
+        foreach ($bad in @(@('2', $thumb), @('1', ('B' * 40)), @('1', $thumb, 'EXTRA'))) {
+            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+            $script:ActTestTransport.Reply = Make-Frame 'VERIFY' $bad
+            Must-Fail { Test-ActCryptoSignature $snapshot ([byte[]]@(1, 2, 3)) $thumb } 'Unexpected signer or extra verification data was accepted.'
         }
+        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+        $script:ActTestTransport.Reply = Make-Frame 'VERIFY' @('1', $thumb)
+        $script:ActTestTransport.ThrowOnFinish = $true
+        Must-Fail { Test-ActCryptoSignature $snapshot ([byte[]]@(1, 2, 3)) $thumb } 'A failed worker exit must not count as verification.'
 
-        foreach ($failureStage in @('Store.Open', 'Store.Certificates', 'Certificates.Count')) {
-            $badCollection = [ActSignerManagedTests.Collection]::new([object[]]@())
-            $badCollection.ThrowOnEnumeration = $true
-            $badCollection.ThrowOnCount = $failureStage -eq 'Certificates.Count'
-            $badStore = [ActSignerManagedTests.Store]::new($badCollection)
-            $badStore.FailureStage = $failureStage
-            $goodCollection = [ActSignerManagedTests.Collection]::new([object[]]@())
-            $goodCollection.ThrowOnEnumeration = $true
-            $goodStore = [ActSignerManagedTests.Store]::new($goodCollection)
+        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+        $script:ActTestTransport.Reply = Make-Frame 'DISCOVER' @('0', '0', 'EXTRA')
+        $found = Get-ActCertificates
+        Assert-Case ($found.Certificates.Count -eq 0 -and $found.Warnings.Count -gt 0) 'Malformed discovery must show an error and no partial list.'
 
-            [ActSignerManagedTests.StoreFactory]::Reset()
-            [ActSignerManagedTests.StoreFactory]::Stores.Enqueue($badStore)
-            [ActSignerManagedTests.StoreFactory]::Stores.Enqueue($goodStore)
-            $discovery = Get-ActCertificates
-
-            Assert-Managed ($discovery.Certificates.Count -eq 0) 'A failing/empty store pair does not invent certificates.'
-            Assert-Managed ([ActSignerManagedTests.StoreFactory]::CreateCalls -eq 2) 'Discovery continues to the second store after an error.'
-            Assert-Managed ($badStore.OpenKind -eq 100 -and $goodStore.OpenKind -eq 2) 'Discovery retains container/current-user store kinds.'
-            Assert-Managed ($badStore.OpenName -ceq 'My' -and $goodStore.OpenName -ceq 'My' -and $badStore.OpenFlags -eq 0 -and $goodStore.OpenFlags -eq 0) 'Discovery preserves store names and read-only flags.'
-            $failureWarnings = @($discovery.Warnings | Where-Object { $_ -like '*Injected*failure*' })
-            Assert-Managed ($failureWarnings.Count -eq 1) 'The injected store error is visible once.'
-            Assert-Managed ($failureWarnings[0].Contains($failureStage)) 'Error includes the precise failed stage.'
-            Assert-Managed ($failureWarnings[0] -match '0x80004003') 'Error preserves the original NullReference HRESULT.'
-            Assert-Managed ($failureWarnings[0] -match 'NullReferenceException') 'Error preserves the original exception type.'
-            Assert-Managed ($goodStore.CloseCalls -eq 1) 'A successfully opened store is closed.'
-            $expectedBadCloseCount = if ($failureStage -eq 'Store.Open') { 0 } else { 1 }
-            Assert-Managed ($badStore.CloseCalls -eq $expectedBadCloseCount) 'Cleanup closes the failed store only if it opened.'
-            Assert-Managed ($badCollection.EnumerationCalls -eq 0 -and $goodCollection.EnumerationCalls -eq 0) 'Discovery never enumerates collection objects implicitly.'
-            $testCount++
-            Write-Host "PASS discovery error reporting and cleanup: $failureStage"
-        }
+        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+        $script:ActTestTransport.ThrowOnExchange = $true
+        $status = Test-ActCryptoPro
+        Assert-Case (-not $status.Available -and $status.Message.Contains('CScript') -and -not $status.Message.Contains('UNSAFE_PROVIDER_DETAIL')) 'Host denial/error must be understandable without raw provider text.'
+    } finally {
+        Set-Item Function:script:New-ActBridgeTransport -Value $savedFactory
+        Remove-Variable ActTestTransport -Scope Script -ErrorAction SilentlyContinue
     }
-    finally {
-        Set-Item Function:script:New-ActComObject -Value $originalFactory
-        [ActSignerManagedTests.StoreFactory]::Reset()
-    }
-
-    Write-Host ("PASS: {0} managed regression groups. Real Windows COM/CryptoPro integration was not exercised." -f $testCount)
+    Write-Host 'PASS: PowerShell protocol, snapshot API, signer matching, host errors and closed-session checks.'
 }
+
+$node = Get-Command node -ErrorAction SilentlyContinue
+if ($null -eq $node) {
+    Write-Host 'SKIP: native JScript source mock tests need Node.js; PowerShell checks above completed. No real COM was tested.'
+    return
+}
+$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('ActSigner-bridge-tests-' + [Guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($testRoot)
+$testScript = Join-Path $testRoot 'worker-mocks.js'
+$nodeProgram = @'
+"use strict";
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+const source = fs.readFileSync(process.argv[2], "utf8");
+const A = "A".repeat(40), B = "B".repeat(40);
+let passed = 0;
+function blob(bytes) {
+    const text = Buffer.from(bytes).toString("base64");
+    return [String(bytes.length)].concat(text.match(/.{1,49152}/g) || []);
+}
+function request(command, index, fields) {
+    return ["ACTSIGNER/1", index.toString(16).padStart(32, "0"), command].concat(fields || [], ["END"]);
+}
+function cert(thumb, options, stats) {
+    return {
+        Thumbprint: thumb,
+        HasPrivateKey: function () { stats.eligibility++; return options.key !== false; },
+        PublicKey: function () { return { Algorithm: { Value: options.oid || "1.2.643.7.1.1.1.1" } }; },
+        ValidFromDate: new Date(Date.now() - 86400000),
+        ValidToDate: new Date(Date.now() + (options.expired ? -1000 : 86400000)),
+        Export: function (mode) { assert.strictEqual(mode, 0); return Buffer.from("SYNTHETIC-PUBLIC-CERTIFICATE").toString("base64"); }
+    };
+}
+function run(lines, options) {
+    options = options || {};
+    const input = lines.slice(), output = [];
+    const stats = { opens: [], sign: 0, verify: 0, eligibility: 0, creates: 0, attributes: 0 };
+    const quit = {};
+    let exit = null;
+    const certificates = [cert(A, options, stats), cert(B, {}, stats)];
+    function collection(list) {
+        return {
+            Count: options.nullCount ? null : list.length,
+            Item: function (i) { assert(i >= 1 && i <= list.length); return list[i - 1]; },
+            Find: function (mode, thumb, valid) {
+                assert.strictEqual(mode, 0);
+                assert.strictEqual(valid, false);
+                return collection(options.wrongFind ? [cert(B, {}, stats)] : list.filter(function (c) { return c.Thumbprint === thumb; }));
+            }
+        };
+    }
+    const context = {
+        WScript: {
+            Arguments: { length: 0 },
+            StdIn: { ReadLine: function () { if (input.length === 0) throw new Error("EOF"); return input.shift(); } },
+            StdOut: { WriteLine: function (value) { output.push(String(value)); } },
+            Quit: function (code) { exit = code; throw quit; }
+        },
+        ActiveXObject: function (name) {
+            stats.creates++;
+            if (name === "CAdESCOM.Store") {
+                let kind = null;
+                return {
+                    Open: function (location, store, mode) {
+                        assert.strictEqual(store, "My"); assert.strictEqual(mode, 0);
+                        assert([0, 2, 100].includes(location));
+                        kind = location; stats.opens.push(location);
+                        if (options.expireBeforeSign && stats.opens.length >= 2) certificates[0].ValidToDate = new Date(0);
+                    },
+                    get Certificates() { return collection(kind === 0 ? [] : certificates); },
+                    Close: function () {}
+                };
+            }
+            if (name === "CAdESCOM.CPSigner") {
+                return { AuthenticatedAttributes2: { Add: function (attribute) {
+                    assert.strictEqual(attribute.Name, 0);
+                    assert.strictEqual(typeof attribute.Value, "number");
+                    stats.attributes++;
+                } } };
+            }
+            if (name === "CAdESCOM.CPAttribute") return {};
+            if (name === "CAdESCOM.CadesSignedData") {
+                let content = null, encoding = null;
+                const data = {
+                    set ContentEncoding(value) { assert.strictEqual(value, 1); encoding = value; },
+                    set Content(value) { assert.strictEqual(encoding, 1); content = value; },
+                    SignCades: function (signer, type, detached, outputEncoding) {
+                        stats.sign++;
+                        assert.strictEqual(signer.Certificate.Thumbprint, A);
+                        assert.strictEqual(signer.CheckCertificate, true);
+                        assert.strictEqual(signer.Options, 2);
+                        assert.strictEqual(type, 1); assert.strictEqual(detached, true); assert.strictEqual(outputEncoding, 0);
+                        assert.strictEqual(content, options.pdf.toString("base64"));
+                        assert(stats.eligibility >= 2, "eligibility must be repeated before signing");
+                        if (options.emptySignature) return "";
+                        if (options.nullSignature) return null;
+                        return Buffer.from("MOCK-SIGNATURE").toString("base64");
+                    },
+                    VerifyCades: function (signature, type, detached) {
+                        stats.verify++;
+                        assert.strictEqual(type, 1); assert.strictEqual(detached, true);
+                        assert.strictEqual(content, options.pdf.toString("base64"));
+                        assert.strictEqual(signature, Buffer.from("MOCK-SIGNATURE").toString("base64"));
+                        if (options.verifyFails) {
+                            const error = new Error("UNSAFE_PROVIDER_DETAIL");
+                            error.number = -2146885628;
+                            throw error;
+                        }
+                    },
+                    Signers: {
+                        Count: options.signerCount === undefined ? 1 : options.signerCount,
+                        Item: function (i) { assert.strictEqual(i, 1); return { Certificate: { Thumbprint: options.otherSigner ? B : A } }; }
+                    }
+                };
+                return data;
+            }
+            throw new Error("Unexpected COM class: " + name);
+        }
+    };
+    vm.createContext(context);
+    vm.runInContext("Date.prototype.getVarDate = function () { return this.getTime(); };", context);
+    try { vm.runInContext(source, context, { timeout: 5000 }); } catch (error) { if (error !== quit) throw error; }
+    const frames = [];
+    let frame = [];
+    output.forEach(function (line) {
+        frame.push(line);
+        if (line === "END") { frames.push(frame); frame = []; }
+    });
+    assert.strictEqual(frame.length, 0, "incomplete output frame");
+    frames.forEach(function (f) {
+        assert.strictEqual(f[0], "ACTSIGNER/1");
+        assert(/^[a-f0-9]{32}$/.test(f[1]));
+        assert(["OK", "ERROR"].includes(f[2]));
+    });
+    return { exit: exit, frames: frames, output: output, stats: stats, remaining: input.length };
+}
+function test(name, fn) { fn(); passed++; }
+const pdf = Buffer.alloc(73731);
+for (let i = 0; i < pdf.length; i++) pdf[i] = i % 251;
+const select = request("SELECT", 1, ["100", A]);
+const sign = request("SIGN", 2, ["100", A].concat(blob(pdf)));
+const close = request("CLOSE", 9);
+test("persistent source selection and repeated signing", function () {
+    const result = run(select.concat(sign, request("SIGN", 3, ["100", A].concat(blob(pdf))), close), { pdf: pdf });
+    assert.strictEqual(result.exit, 0);
+    assert.strictEqual(result.frames.length, 4);
+    assert(result.frames.every(function (f) { return f[2] === "OK"; }));
+    assert.deepStrictEqual(result.stats.opens, [100, 100, 100]);
+    assert.strictEqual(result.stats.sign, 2);
+    assert.strictEqual(result.stats.attributes, 2);
+    assert.strictEqual(result.remaining, 0);
+});
+test("source mismatch never signs", function () {
+    const result = run(select.concat(request("SIGN", 2, ["2", A].concat(blob(pdf)))), { pdf: pdf });
+    assert.strictEqual(result.exit, 1);
+    assert.strictEqual(result.frames[1][5], "SESSION");
+    assert.strictEqual(result.stats.sign, 0);
+});
+test("expiration after selection is rechecked", function () {
+    const result = run(select.concat(sign), { pdf: pdf, expireBeforeSign: true });
+    assert.strictEqual(result.exit, 1);
+    assert.strictEqual(result.frames[1][5], "VALIDITY");
+    assert.strictEqual(result.stats.sign, 0);
+});
+for (const item of [
+    ["missing key", { key: false }, "NO_KEY"],
+    ["wrong algorithm", { oid: "1.2.840.113549.1.1.1" }, "ALGORITHM"],
+    ["expired certificate", { expired: true }, "VALIDITY"],
+    ["wrong Find result", { wrongFind: true }, "THUMBPRINT"]
+]) {
+    test(item[0], function () {
+        const result = run(select, item[1]);
+        assert.strictEqual(result.exit, 1);
+        assert.strictEqual(result.frames[0][5], item[2]);
+        assert.strictEqual(result.stats.sign, 0);
+    });
+}
+test("discovery prefers container, deduplicates and returns open certificates", function () {
+    const result = run(request("DISCOVER", 1).concat(close));
+    assert.strictEqual(result.exit, 0);
+    assert.strictEqual(result.frames[0][4], "2");
+    assert.strictEqual(result.frames[0][5], "100");
+    assert.strictEqual(result.frames[0][6], A);
+    assert.deepStrictEqual(result.stats.opens, [100, 2]);
+    assert.strictEqual(result.stats.sign, 0);
+});
+test("null Count is an error, never a successful zero count", function () {
+    const result = run(request("DISCOVER", 1).concat(close), { nullCount: true });
+    assert.strictEqual(result.exit, 0);
+    assert(result.frames[0].includes("PROTOCOL"));
+    assert(!result.frames[0].includes("COUNT"));
+});
+const verify = request("VERIFY", 1, [A].concat(blob(pdf), blob(Buffer.from("MOCK-SIGNATURE"))));
+test("detached verification with one exact signer", function () {
+    const result = run(verify.concat(close), { pdf: pdf });
+    assert.strictEqual(result.exit, 0);
+    assert.deepStrictEqual(result.frames[0].slice(4, -1), ["1", A]);
+    assert.strictEqual(result.stats.verify, 1);
+    assert.strictEqual(result.stats.sign, 0);
+    assert.strictEqual(result.stats.opens.length, 0);
+});
+for (const options of [{ signerCount: 2 }, { signerCount: true }, { otherSigner: true }, { verifyFails: true }]) {
+    test("bad verification never succeeds", function () {
+        const result = run(verify, Object.assign({ pdf: pdf }, options));
+        assert.strictEqual(result.exit, 1);
+        assert.strictEqual(result.frames[0][2], "ERROR");
+        assert(!result.output.join("").includes("UNSAFE_PROVIDER_DETAIL"));
+    });
+}
+for (const options of [{ emptySignature: true }, { nullSignature: true }]) {
+    test("empty/null signature is rejected", function () {
+        const result = run(select.concat(sign), Object.assign({ pdf: pdf }, options));
+        assert.strictEqual(result.exit, 1);
+        assert.strictEqual(result.frames[1][2], "ERROR");
+    });
+}
+for (const fields of [
+    ["100", A, "67108865"],
+    ["100", A, "0"],
+    ["100", A, "1", "Zh=="],
+    ["100", A, "3", "YW J"]
+]) {
+    test("invalid binary request rejected before COM", function () {
+        const result = run(request("SIGN", 1, fields));
+        assert.strictEqual(result.exit, 2);
+        assert.strictEqual(result.stats.creates, 0);
+        assert.strictEqual(result.stats.sign, 0);
+    });
+}
+test("no unframed command or eval path", function () {
+    const result = run(["bad", "input"]);
+    assert.strictEqual(result.exit, 2);
+    assert.strictEqual(result.stats.creates, 0);
+});
+console.log("PASS: " + passed + " JScript worker mock/protocol cases. No real COM, token or cryptographic signature was used.");
+'@
+try {
+    [IO.File]::WriteAllText($testScript, $nodeProgram, (New-Object Text.UTF8Encoding -ArgumentList $false))
+    & $node.Source $testScript (Join-Path $PSScriptRoot 'ActSigner.CryptoPro.js')
+    Assert-BridgeTest ($LASTEXITCODE -eq 0) 'JScript source mock tests failed.'
+} finally {
+    Remove-Item -LiteralPath $testRoot -Recurse -Force
+}
+Write-Host 'ActSigner.CryptoPro protocol/mock tests passed. Native Windows/CryptoPro verification is still required.'

@@ -1,71 +1,214 @@
 ﻿#requires -Version 5.1
 Set-StrictMode -Version 2.0
 
-function New-ActComObject {
-    param([Parameter(Mandatory = $true)][string]$ProgId)
-    $type = [Type]::GetTypeFromProgID($ProgId, $true)
-    $value = [Activator]::CreateInstance($type)
-    if ($null -eq $value) { throw ('Не удалось создать ' + $ProgId) }
-    return ,$value
-}
+$script:ActBridgeMaxBytes = 64MB
+$script:ActBridgeScript = Join-Path $PSScriptRoot 'ActSigner.CryptoPro.js'
 
-# Use IDispatch through .NET reflection, without PowerShell's COM member adapter.
-# Unary comma preserves empty/single-item/iterable COM collections as one object.
-function Get-ActComProperty {
-    param(
-        [Parameter(Mandatory = $true)][object]$Target,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [object[]]$Arguments = @()
-    )
-    $flags = [Reflection.BindingFlags]::GetProperty -bor [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Instance
-    $value = $Target.GetType().InvokeMember($Name, $flags, $null, $Target, [object[]]$Arguments)
-    return ,$value
-}
+# Native CScript owns all CAdESCOM objects. PowerShell exchanges only public
+# certificate data, PDF snapshots and signatures through inherited local pipes.
+function Initialize-ActBridgeTransport {
+    if ('ActSigner.CScriptTransport' -as [type]) { return }
+    Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
 
-function Invoke-ActComMethod {
-    param(
-        [Parameter(Mandatory = $true)][object]$Target,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [object[]]$Arguments = @()
-    )
-    $flags = [Reflection.BindingFlags]::InvokeMethod -bor [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Instance
-    $value = $Target.GetType().InvokeMember($Name, $flags, $null, $Target, [object[]]$Arguments)
-    return ,$value
-}
+namespace ActSigner {
+    public sealed class CScriptTransport : IDisposable {
+        private const int ChunkBytes = 36864;
+        private const int ChunkChars = 49152;
+        private readonly object sync = new object();
+        private Process process;
+        private StreamWriter input;
+        private StreamReader output;
+        private Task stderrDrain;
+        private bool disposed;
+        public bool IsClosed { get { return disposed; } }
 
-function Set-ActComProperty {
-    param(
-        [Parameter(Mandatory = $true)][object]$Target,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][AllowNull()][object]$Value
-    )
-    $flags = [Reflection.BindingFlags]::SetProperty -bor [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Instance
-    # SetProperty supports both PROPPUT and PROPPUTREF for COM object properties.
-    [void]$Target.GetType().InvokeMember($Name, $flags, $null, $Target, [object[]]@(,$Value))
-}
+        public static string QuoteArgument(string value) {
+            if (value == null) value = "";
+            StringBuilder result = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char c in value) {
+                if (c == '\\') { slashes++; continue; }
+                if (c == '"') {
+                    result.Append('\\', slashes * 2 + 1);
+                    result.Append('"');
+                } else {
+                    result.Append('\\', slashes);
+                    result.Append(c);
+                }
+                slashes = 0;
+            }
+            result.Append('\\', slashes * 2);
+            result.Append('"');
+            return result.ToString();
+        }
 
-function Close-ActComObject {
-    param([object]$Value)
-    if ($null -ne $Value -and [Runtime.InteropServices.Marshal]::IsComObject($Value)) {
-        # Release this reference once; never force all other RCW references closed.
-        try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($Value) } catch { }
+        public CScriptTransport(string executable, string[] arguments) {
+            ProcessStartInfo info = new ProcessStartInfo();
+            info.FileName = executable;
+            List<string> quoted = new List<string>();
+            foreach (string argument in arguments) quoted.Add(QuoteArgument(argument));
+            info.Arguments = String.Join(" ", quoted.ToArray());
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            info.RedirectStandardInput = true;
+            info.RedirectStandardOutput = true;
+            info.RedirectStandardError = true;
+            Encoding wire = new UnicodeEncoding(false, false, true);
+            info.StandardOutputEncoding = wire;
+            info.StandardErrorEncoding = wire;
+            process = new Process();
+            process.StartInfo = info;
+            try {
+                if (!process.Start()) throw new IOException("The script host did not start.");
+                // //U applies to redirected input as well as output. The protocol
+                // alphabet is ASCII; its wire encoding is UTF-16LE, without a BOM.
+                input = new StreamWriter(process.StandardInput.BaseStream, wire, 8192);
+                input.NewLine = "\r\n";
+                output = process.StandardOutput;
+                stderrDrain = DrainAsync(process.StandardError);
+            } catch {
+                Dispose();
+                throw;
+            }
+        }
+
+        private static async Task DrainAsync(StreamReader reader) {
+            // Drain continuously, retain no host/provider stderr or personal paths.
+            try {
+                char[] buffer = new char[4096];
+                while (await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false) != 0) { }
+            } catch { }
+        }
+
+        private async Task WriteBlobAsync(byte[] bytes) {
+            if (bytes == null || bytes.Length == 0 || bytes.Length > 67108864)
+                throw new InvalidDataException("Invalid binary length.");
+            await input.WriteLineAsync(bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
+            for (int offset = 0; offset < bytes.Length; offset += ChunkBytes) {
+                int length = Math.Min(ChunkBytes, bytes.Length - offset);
+                await input.WriteLineAsync(Convert.ToBase64String(bytes, offset, length)).ConfigureAwait(false);
+            }
+        }
+
+        private async Task WriteRequestAsync(string id, string command, int kind, string thumbprint, byte[] pdf, byte[] signature) {
+            await input.WriteLineAsync("ACTSIGNER/1").ConfigureAwait(false);
+            await input.WriteLineAsync(id).ConfigureAwait(false);
+            await input.WriteLineAsync(command).ConfigureAwait(false);
+            if (command == "SELECT" || command == "SIGN") {
+                await input.WriteLineAsync(kind.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
+                await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
+            }
+            if (command == "VERIFY") await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
+            if (command == "SIGN" || command == "VERIFY") await WriteBlobAsync(pdf).ConfigureAwait(false);
+            if (command == "VERIFY") await WriteBlobAsync(signature).ConfigureAwait(false);
+            await input.WriteLineAsync("END").ConfigureAwait(false);
+            await input.FlushAsync().ConfigureAwait(false);
+        }
+
+        private async Task<string[]> ReadFrameAsync(int maxCharacters) {
+            List<string> lines = new List<string>();
+            StringBuilder line = new StringBuilder();
+            char[] buffer = new char[8192];
+            int total = 0;
+            bool firstCharacter = true;
+            while (true) {
+                int read = await output.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+                if (read == 0) throw new InvalidDataException("The script host closed an incomplete response.");
+                for (int i = 0; i < read; i++) {
+                    char c = buffer[i];
+                    if (firstCharacter && c == '\uFEFF') { firstCharacter = false; continue; }
+                    firstCharacter = false;
+                    total++;
+                    if (total > maxCharacters) throw new InvalidDataException("The response is too large.");
+                    if (c == '\n') {
+                        if (line.Length > 0 && line[line.Length - 1] == '\r') line.Length--;
+                        string value = line.ToString();
+                        line.Length = 0;
+                        if (value.IndexOf('\r') >= 0) throw new InvalidDataException("Invalid response line.");
+                        lines.Add(value);
+                        if (value == "END") {
+                            if (i + 1 != read) throw new InvalidDataException("Trailing response data.");
+                            return lines.ToArray();
+                        }
+                    } else {
+                        if (c > 127 || (c < 32 && c != '\r'))
+                            throw new InvalidDataException("Non-protocol script-host output.");
+                        line.Append(c);
+                        if (line.Length > ChunkChars + 1) throw new InvalidDataException("The response line is too long.");
+                    }
+                }
+            }
+        }
+
+        public string[] Exchange(string command, int kind, string thumbprint, byte[] pdf, byte[] signature, int timeoutMilliseconds, int maxCharacters) {
+            lock (sync) {
+                if (disposed) throw new ObjectDisposedException("CScriptTransport");
+                string id = Guid.NewGuid().ToString("N");
+                try {
+                    Task<string[]> read = ReadFrameAsync(maxCharacters);
+                    Task write = WriteRequestAsync(id, command, kind, thumbprint, pdf, signature);
+                    Task all = Task.WhenAll(new Task[] { read, write });
+                    if (!all.Wait(timeoutMilliseconds)) throw new TimeoutException("The script-host operation timed out.");
+                    string[] lines = read.Result;
+                    if (lines.Length < 5 || lines[0] != "ACTSIGNER/1" ||
+                        lines[1] != id || lines[3] != command ||
+                        (lines[2] != "OK" && lines[2] != "ERROR") ||
+                        lines[lines.Length - 1] != "END")
+                        throw new InvalidDataException("Unexpected response frame.");
+                    if (lines[2] == "ERROR") {
+                        Dispose();
+                    } else if (command != "CLOSE" && process.HasExited) {
+                        throw new InvalidDataException("The script host exited before session close.");
+                    }
+                    return lines;
+                } catch (AggregateException e) {
+                    Dispose();
+                    throw e.GetBaseException();
+                } catch {
+                    Dispose();
+                    throw;
+                }
+            }
+        }
+
+        public void Finish(int timeoutMilliseconds) {
+            lock (sync) {
+                if (disposed) throw new ObjectDisposedException("CScriptTransport");
+                try {
+                    string[] close = Exchange("CLOSE", 0, "", null, null, timeoutMilliseconds, 2048);
+                    if (close.Length != 5 || close[2] != "OK")
+                        throw new InvalidDataException("Invalid close response.");
+                    if (!process.WaitForExit(timeoutMilliseconds)) throw new TimeoutException("The script host did not exit.");
+                    if (process.ExitCode != 0) throw new InvalidDataException("The script host failed.");
+                    Task<string> remaining = output.ReadToEndAsync();
+                    if (!remaining.Wait(timeoutMilliseconds) || remaining.Result.Length != 0)
+                        throw new InvalidDataException("Trailing script-host output.");
+                } finally { Dispose(); }
+            }
+        }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            // Kill before touching the writer: Flush/Dispose on a blocked pipe
+            // must never stall shutdown or submit another signing request.
+            if (process != null) {
+                try { if (!process.HasExited) process.Kill(); } catch { }
+                try { process.WaitForExit(2000); } catch { }
+                try { if (input != null) input.BaseStream.Close(); } catch { }
+                try { if (output != null) output.Close(); } catch { }
+                try { process.Dispose(); } catch { }
+            }
+        }
     }
 }
-
-function Get-ActNativeError {
-    param([System.Exception]$Exception)
-    $detail = $Exception
-    while ($null -ne $detail.InnerException) { $detail = $detail.InnerException }
-    return ('{0} (0x{1}; {2})' -f $detail.Message, $detail.HResult.ToString('X8'), $detail.GetType().Name)
-}
-
-function Get-ActStageError {
-    param(
-        [Parameter(Mandatory = $true)][string]$Stage,
-        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord
-    )
-    $line = $ErrorRecord.InvocationInfo.ScriptLineNumber
-    return ('Этап {0}: {1}. Строка {2}.' -f $Stage, (Get-ActNativeError $ErrorRecord.Exception), $line)
+'@
 }
 
 function Get-ActNormalizedThumbprint {
@@ -75,131 +218,203 @@ function Get-ActNormalizedThumbprint {
     return $value
 }
 
-function Test-ActCryptoPro {
-    # The lookup does not instantiate and prematurely release the Store before discovery.
+function Get-ActCScriptPath {
+    param(
+        [string]$WindowsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows),
+        [bool]$OS64Bit = [Environment]::Is64BitOperatingSystem,
+        [bool]$Process64Bit = [Environment]::Is64BitProcess
+    )
+    if ([string]::IsNullOrWhiteSpace($WindowsDirectory)) { throw 'Не удалось найти Windows Script Host (CScript).' }
+    $directory = 'System32'
+    if ($OS64Bit -and -not $Process64Bit) { $directory = 'Sysnative' }
+    return [IO.Path]::Combine($WindowsDirectory, $directory, 'cscript.exe')
+}
+
+function New-ActBridgeTransport {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Подпись через КриптоПро требует Windows.' }
+    $executable = Get-ActCScriptPath
+    if (-not [IO.File]::Exists($executable)) { throw 'Windows Script Host (CScript) не найден. Проверьте доступность компонента в Windows.' }
+    if (-not [IO.File]::Exists($script:ActBridgeScript)) { throw 'Рядом с программой отсутствует ActSigner.CryptoPro.js. Распакуйте полный комплект файлов.' }
     try {
-        foreach ($progId in @('CAdESCOM.Store', 'CAdESCOM.CadesSignedData', 'CAdESCOM.CPSigner')) {
-            if ($null -eq [Type]::GetTypeFromProgID($progId, $false)) {
-                throw ('Компонент не зарегистрирован: ' + $progId)
-            }
-        }
-        return [pscustomobject]@{ Available = $true; Message = '' }
+        Initialize-ActBridgeTransport
+        $arguments = [string[]]@('//nologo', '//I', '//U', '//E:JScript', $script:ActBridgeScript)
+        return [ActSigner.CScriptTransport]::new($executable, $arguments)
+    } catch {
+        throw 'Не удалось запустить Windows Script Host (CScript). Компонент может быть недоступен или запрещён политикой Windows.'
     }
-    catch {
+}
+
+function Get-ActBridgeErrorText {
+    param([string]$Stage, [string]$Code, [string]$HResult)
+    $description = switch ($Code) {
+        'CERT_NOT_FOUND' { 'Выбранный сертификат больше не найден в выбранном хранилище.' }
+        'NO_KEY' { 'Сертификат не связан с доступным закрытым ключом.' }
+        'ALGORITHM' { 'Для подписи требуется сертификат ГОСТ Р 34.10-2012.' }
+        'VALIDITY' { 'Сертификат находится вне срока действия. Проверьте дату в Windows.' }
+        'THUMBPRINT' { 'Отпечаток сертификата не совпал с выбранным.' }
+        'SIGNER_COUNT' { 'В новой подписи должен быть ровно один подписант.' }
+        'SIGNER_MISMATCH' { 'Новая подпись создана другим сертификатом.' }
+        'BINARY_LIMIT' { 'Пустые данные или превышен предел 64 МиБ.' }
+        'DISCOVERY_LIMIT' { 'Превышен допустимый объём списка сертификатов.' }
+        'SESSION' { 'Сеанс подписи недействителен или уже закрыт.' }
+        'PROTOCOL' { 'Получены некорректные данные локального процесса КриптоПро.' }
+        default { 'КриптоПро не выполнил операцию. Проверьте носитель и состояние сертификата.' }
+    }
+    return ('{0} Этап {1}; код {2}; HRESULT {3}.' -f $description, $Stage, $Code, $HResult)
+}
+
+function Invoke-ActBridgeExchange {
+    param($Transport, [string]$Command, [int]$Kind = 0, [string]$Thumbprint = '', [byte[]]$PdfBytes = $null, [byte[]]$SignatureBytes = $null, [int]$Timeout = 60000)
+    $maximum = 24MB
+    if ($Command -eq 'SIGN') { $maximum = 90MB }
+    if ($Command -in @('CHECK', 'VERIFY')) { $maximum = 4096 }
+    try {
+        $reply = $Transport.Exchange($Command, $Kind, $Thumbprint, $PdfBytes, $SignatureBytes, $Timeout, $maximum)
+    } catch {
+        $error = $_.Exception
+        while ($null -ne $error.InnerException) { $error = $error.InnerException }
+        if ($error -is [TimeoutException]) {
+            throw ('Истекло время ожидания КриптоПро ({0} с). Операция остановлена, сеанс закрыт. Начните подписание заново после проверки окна PIN или сертификата.' -f [int]($Timeout / 1000))
+        }
+        throw 'Windows Script Host (CScript) завершился без корректного ответа. Он может быть недоступен или запрещён политикой Windows; проверьте установленный комплект программы и КриптоПро.'
+    }
+    if ($reply.Length -lt 5 -or $reply[0] -cne 'ACTSIGNER/1' -or $reply[3] -cne $Command -or $reply[-1] -cne 'END') { throw 'Некорректный ответ локального процесса КриптоПро.' }
+    if ($reply[2] -ceq 'ERROR') {
+        if ($reply.Length -ne 8 -or $reply[4] -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $reply[5] -cnotmatch '^[A-Z_]{1,32}$' -or $reply[6] -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректный код ошибки локального процесса КриптоПро.' }
+        throw (Get-ActBridgeErrorText $reply[4] $reply[5] $reply[6])
+    }
+    if ($reply[2] -cne 'OK') { throw 'Локальный процесс КриптоПро не подтвердил операцию.' }
+    if ($reply.Length -eq 5) { return ,([string[]]@()) }
+    return ,([string[]]$reply[4..($reply.Length - 2)])
+}
+
+function Invoke-ActBridgeOnce {
+    param([string]$Command, [int]$Kind = 0, [string]$Thumbprint = '', [byte[]]$PdfBytes = $null, [byte[]]$SignatureBytes = $null, [int]$Timeout = 60000)
+    $transport = New-ActBridgeTransport
+    try {
+        $payload = Invoke-ActBridgeExchange $transport $Command $Kind $Thumbprint $PdfBytes $SignatureBytes $Timeout
+        try { $transport.Finish(5000) } catch { throw 'Локальный процесс КриптоПро не завершился корректно. Результат не принят.' }
+        return ,$payload
+    } finally { $transport.Dispose() }
+}
+
+function Read-ActBridgeField {
+    param([string[]]$Lines, [ref]$Index)
+    if ($Index.Value -ge $Lines.Length) { throw 'Неполный ответ локального процесса КриптоПро.' }
+    $value = $Lines[$Index.Value]
+    $Index.Value++
+    return $value
+}
+
+function Read-ActBridgeNumber {
+    param([string[]]$Lines, [ref]$Index, [int]$Maximum)
+    $value = Read-ActBridgeField $Lines $Index
+    if ($value -cnotmatch '^(0|[1-9][0-9]{0,8})$') { throw 'Некорректное число в ответе локального процесса КриптоПро.' }
+    $number = [long]$value
+    if ($number -gt $Maximum) { throw 'Превышен размер ответа локального процесса КриптоПро.' }
+    return [int]$number
+}
+
+function Read-ActBridgeBlob {
+    param([string[]]$Lines, [ref]$Index, [int]$Maximum = 67108864)
+    $length = Read-ActBridgeNumber $Lines $Index $Maximum
+    if ($length -le 0) { throw 'КриптоПро вернул пустые двоичные данные.' }
+    $remaining = [int](4 * [Math]::Ceiling($length / 3.0))
+    $chunks = New-Object 'System.Collections.Generic.List[string]'
+    while ($remaining -gt 0) {
+        $chunk = Read-ActBridgeField $Lines $Index
+        $expected = [Math]::Min(49152, $remaining)
+        if ($chunk.Length -ne $expected -or $chunk -cnotmatch '^[A-Za-z0-9+/]+={0,2}$') { throw 'Некорректный Base64 в ответе локального процесса КриптоПро.' }
+        if ($remaining -gt 49152 -and $chunk.Contains('=')) { throw 'Некорректное завершение Base64.' }
+        $chunks.Add($chunk)
+        $remaining -= $chunk.Length
+    }
+    $base64 = [string]::Concat($chunks.ToArray())
+    try { [byte[]]$bytes = [Convert]::FromBase64String($base64) } catch { throw 'Не удалось разобрать Base64 локального процесса КриптоПро.' }
+    if ($bytes.Length -ne $length -or [Convert]::ToBase64String($bytes) -cne $base64) { throw 'Размер или кодирование данных КриптоПро не совпали с протоколом.' }
+    return ,$bytes
+}
+
+function Assert-ActBridgeEnd {
+    param([string[]]$Lines, [int]$Index)
+    if ($Index -ne $Lines.Length) { throw 'Лишние данные в ответе локального процесса КриптоПро.' }
+}
+
+function ConvertFrom-ActBridgeCertificate {
+    param([int]$Kind, [string]$Thumbprint, [byte[]]$Raw)
+    if ($Kind -notin @(2, 100)) { throw 'Неизвестное хранилище сертификата.' }
+    $expected = Get-ActNormalizedThumbprint $Thumbprint
+    if ([Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Raw) -ne [Security.Cryptography.X509Certificates.X509ContentType]::Cert) {
+        throw 'КриптоПро вернул данные, не являющиеся открытым сертификатом X509.'
+    }
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($Raw)
+    try {
+        $actual = Get-ActNormalizedThumbprint $certificate.Thumbprint
+        if ($actual -cne $expected) { throw 'Отпечаток открытого сертификата не совпал с ответом КриптоПро.' }
+        if ($certificate.GetKeyAlgorithm() -notin @('1.2.643.7.1.1.1.1', '1.2.643.7.1.1.1.2')) { throw 'Требуется сертификат ГОСТ Р 34.10-2012.' }
+        $now = [DateTime]::Now
+        if ($certificate.NotBefore -gt $now -or $certificate.NotAfter -le $now) { throw 'Сертификат находится вне срока действия.' }
+        $name = $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = $certificate.Subject }
+        return [pscustomobject]@{
+            Thumbprint = $actual; DisplayName = $name; Subject = $certificate.Subject; Issuer = $certificate.Issuer
+            NotBefore = $certificate.NotBefore; NotAfter = $certificate.NotAfter
+            Source = $(if ($Kind -eq 100) { 'Контейнер КриптоПро' } else { 'Личное хранилище Windows' })
+            StoreKind = $Kind
+        }
+    } finally { $certificate.Dispose() }
+}
+
+function Test-ActCryptoPro {
+    try {
+        $payload = Invoke-ActBridgeOnce 'CHECK'
+        Assert-ActBridgeEnd $payload 0
+        return [pscustomobject]@{ Available = $true; Message = '' }
+    } catch {
         return [pscustomobject]@{
             Available = $false
-            Message = ('Не найден компонент КриптоПро ЭЦП (CAdESCOM). ' +
-                'Установите КриптоПро ЭЦП Browser plug-in в Windows внутри VM, затем запустите программу снова.' +
-                [Environment]::NewLine + 'Официальная страница: https://cryptopro.ru/products/cades/plugin' +
-                [Environment]::NewLine + (Get-ActNativeError $_.Exception))
+            Message = ('Не удалось подготовить КриптоПро через Windows Script Host (CScript). ' + $_.Exception.Message)
         }
     }
 }
 
 function Get-ActCertificates {
-    # 100 reads certificates directly from containers; 2 is CurrentUser\My.
-    # Every refresh opens fresh stores. No key import/export and no signing here.
-    $byThumbprint = @{}
     $warnings = New-Object 'System.Collections.Generic.List[string]'
-    $storeCounts = New-Object 'System.Collections.Generic.List[string]'
-    $expiredCount = 0
-    $missingKeyCount = 0
-    $unsupportedCount = 0
-    $unreadableCount = 0
-    $now = [DateTime]::Now
-    foreach ($kind in @(100, 2)) {
-        $store = $null
-        $certificates = $null
-        $opened = $false
-        $source = if ($kind -eq 100) { 'Контейнер КриптоПро' } else { 'Личное хранилище Windows' }
-        $stage = 'создание CAdESCOM.Store'
-        try {
-            $store = New-ActComObject 'CAdESCOM.Store'
-            $stage = 'Store.Open'
-            [void](Invoke-ActComMethod $store 'Open' @([int]$kind, 'My', [int]0))
-            $opened = $true
-            $stage = 'Store.Certificates'
-            $certificates = Get-ActComProperty $store 'Certificates'
-            if ($null -eq $certificates) { throw 'КриптоПро вернул пустой объект коллекции сертификатов.' }
-            $stage = 'Certificates.Count'
-            $count = [int](Get-ActComProperty $certificates 'Count')
-            $storeCounts.Add(('{0}: сертификатов прочитано {1}.' -f $source, $count))
-            for ($i = 1; $i -le $count; $i++) {
-                $certificate = $null
-                $metadata = $null
-                $certificateStage = 'Certificates.Item'
-                try {
-                    # Item is an indexed property, not a method.
-                    $certificate = Get-ActComProperty $certificates 'Item' @([int]$i)
-                    if ($null -eq $certificate) { throw 'КриптоПро вернул пустой объект сертификата.' }
-                    $certificateStage = 'Certificate.HasPrivateKey'
-                    if (-not [bool](Invoke-ActComMethod $certificate 'HasPrivateKey')) {
-                        $missingKeyCount++
-                        continue
-                    }
-                    $certificateStage = 'Certificate.Export'
-                    $publicCertificate = [string](Invoke-ActComMethod $certificate 'Export' @([int]0))
-                    $raw = [Convert]::FromBase64String($publicCertificate)
-                    $certificateStage = 'разбор открытого сертификата X509'
-                    $metadata = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($raw)
-                    if ($metadata.GetKeyAlgorithm() -notin @('1.2.643.7.1.1.1.1', '1.2.643.7.1.1.1.2')) {
-                        $unsupportedCount++
-                        continue
-                    }
-                    if ($metadata.NotBefore -gt $now -or $metadata.NotAfter -le $now) {
-                        $expiredCount++
-                        continue
-                    }
-                    $thumbprint = Get-ActNormalizedThumbprint $metadata.Thumbprint
-                    if ($byThumbprint.ContainsKey($thumbprint)) { continue }
-                    $displayName = $metadata.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-                    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $metadata.Subject }
-                    $byThumbprint[$thumbprint] = [pscustomobject]@{
-                        Thumbprint = $thumbprint
-                        DisplayName = $displayName
-                        Subject = $metadata.Subject
-                        Issuer = $metadata.Issuer
-                        NotBefore = $metadata.NotBefore
-                        NotAfter = $metadata.NotAfter
-                        Source = $source
-                        StoreKind = $kind
-                    }
-                }
-                catch {
-                    $unreadableCount++
-                    if ($unreadableCount -le 5) {
-                        $warnings.Add(('{0}, сертификат {1}. {2}' -f $source, $i, (Get-ActStageError $certificateStage $_)))
-                    }
-                }
-                finally {
-                    if ($null -ne $metadata) { $metadata.Dispose() }
-                    Close-ActComObject $certificate
-                }
+    $byThumbprint = @{}
+    try {
+        $payload = Invoke-ActBridgeOnce 'DISCOVER'
+        $index = 0
+        $count = Read-ActBridgeNumber $payload ([ref]$index) 4096
+        for ($i = 0; $i -lt $count; $i++) {
+            $kind = Read-ActBridgeNumber $payload ([ref]$index) 100
+            $thumb = Read-ActBridgeField $payload ([ref]$index)
+            $raw = Read-ActBridgeBlob $payload ([ref]$index) 1048576
+            try {
+                $certificate = ConvertFrom-ActBridgeCertificate $kind $thumb $raw
+                if (-not $byThumbprint.ContainsKey($certificate.Thumbprint)) { $byThumbprint[$certificate.Thumbprint] = $certificate }
+            } catch { $warnings.Add(('Сертификат {0}: {1}' -f ($i + 1), $_.Exception.Message)) }
+        }
+        $warningCount = Read-ActBridgeNumber $payload ([ref]$index) 64
+        for ($i = 0; $i -lt $warningCount; $i++) {
+            $kind = Read-ActBridgeNumber $payload ([ref]$index) 100
+            if ($kind -notin @(2, 100)) { throw 'Некорректный источник предупреждения КриптоПро.' }
+            $stage = Read-ActBridgeField $payload ([ref]$index)
+            $code = Read-ActBridgeField $payload ([ref]$index)
+            $hr = Read-ActBridgeField $payload ([ref]$index)
+            $number = Read-ActBridgeNumber $payload ([ref]$index) 1000000
+            if ($stage -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $code -cnotmatch '^[A-Z_]{1,32}$' -or $hr -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректное предупреждение КриптоПро.' }
+            $source = if ($kind -eq 100) { 'Контейнер КриптоПро' } else { 'Личное хранилище Windows' }
+            if ($code -eq 'COUNT') {
+                if ($byThumbprint.Count -eq 0) { $warnings.Add(('{0}: сертификатов прочитано {1}.' -f $source, $number)) }
+            } else {
+                $warnings.Add(('{0}: {1} Количество: {2}.' -f $source, (Get-ActBridgeErrorText $stage $code $hr), $number))
             }
         }
-        catch {
-            $warnings.Add(('{0}. {1}' -f $source, (Get-ActStageError $stage $_)))
-        }
-        finally {
-            Close-ActComObject $certificates
-            if ($opened) { try { [void](Invoke-ActComMethod $store 'Close') } catch { } }
-            Close-ActComObject $store
-        }
-    }
-    if ($expiredCount -gt 0) {
-        $warnings.Add(('Вне срока действия: {0}. Проверьте срок сертификатов и дату в Windows VM.' -f $expiredCount))
-    }
-    if ($missingKeyCount -gt 0) {
-        $warnings.Add(('Без связи с закрытым ключом: {0}. При необходимости установите личный сертификат с привязкой к контейнеру через КриптоПро.' -f $missingKeyCount))
-    }
-    if ($unsupportedCount -gt 0) {
-        $warnings.Add(('С другим алгоритмом: {0}. Для подписи нужен сертификат ГОСТ Р 34.10-2012.' -f $unsupportedCount))
-    }
-    if ($unreadableCount -gt 5) {
-        $warnings.Add(('Всего ошибок чтения сертификатов: {0}; выше показаны первые пять.' -f $unreadableCount))
-    }
-    if ($byThumbprint.Count -eq 0) {
-        foreach ($message in $storeCounts) { $warnings.Add($message) }
+        Assert-ActBridgeEnd $payload $index
+    } catch {
+        # Never expose a partial certificate list from a malformed response.
+        $byThumbprint.Clear()
+        $warnings.Add($_.Exception.Message)
     }
     return [pscustomobject]@{
         Certificates = @($byThumbprint.Values | Sort-Object DisplayName, NotAfter, Thumbprint)
@@ -212,112 +427,43 @@ function New-ActCryptoSession {
     $thumbprint = Get-ActNormalizedThumbprint $CertificateInfo.Thumbprint
     $kind = [int]$CertificateInfo.StoreKind
     if ($kind -notin @(2, 100)) { throw 'Неизвестное хранилище сертификата.' }
-    $store = $null
-    $certificates = $null
-    $matches = $null
-    $selected = $null
-    $opened = $false
-    $transferred = $false
-    $stage = 'создание CAdESCOM.Store'
+    $transport = New-ActBridgeTransport
     try {
-        $store = New-ActComObject 'CAdESCOM.Store'
-        $stage = 'Store.Open'
-        [void](Invoke-ActComMethod $store 'Open' @([int]$kind, 'My', [int]0))
-        $opened = $true
-        $stage = 'Store.Certificates'
-        $certificates = Get-ActComProperty $store 'Certificates'
-        $stage = 'Certificates.Find'
-        $matches = Invoke-ActComMethod $certificates 'Find' @([int]0, $thumbprint, $false)
-        $stage = 'Certificates.Count'
-        $count = [int](Get-ActComProperty $matches 'Count')
-        for ($i = 1; $i -le $count; $i++) {
-            $candidate = $null
-            try {
-                $stage = 'Certificates.Item'
-                $candidate = Get-ActComProperty $matches 'Item' @([int]$i)
-                $stage = 'Certificate.HasPrivateKey'
-                if ([bool](Invoke-ActComMethod $candidate 'HasPrivateKey')) {
-                    $selected = $candidate
-                    $candidate = $null
-                    break
-                }
-            }
-            finally { Close-ActComObject $candidate }
+        $payload = Invoke-ActBridgeExchange $transport 'SELECT' $kind $thumbprint
+        $index = 0
+        $actualKind = Read-ActBridgeNumber $payload ([ref]$index) 100
+        $actualThumb = Read-ActBridgeField $payload ([ref]$index)
+        $raw = Read-ActBridgeBlob $payload ([ref]$index) 1048576
+        Assert-ActBridgeEnd $payload $index
+        if ($actualKind -ne $kind -or $actualThumb -cne $thumbprint) { throw 'КриптоПро выбрал другой сертификат или источник.' }
+        $metadata = ConvertFrom-ActBridgeCertificate $kind $thumbprint $raw
+        return [pscustomobject]@{
+            Transport = $transport; Store = $null; Certificate = $metadata
+            Thumbprint = $thumbprint; StoreKind = $kind; Closed = $false
         }
-        if ($null -eq $selected) {
-            throw 'Выбранный сертификат или его закрытый ключ больше не доступен. Подключите носитель и обновите список.'
-        }
-        $stage = 'проверка выбранного сертификата'
-        $foundThumbprint = [string](Get-ActComProperty $selected 'Thumbprint')
-        if ((Get-ActNormalizedThumbprint $foundThumbprint) -ne $thumbprint) {
-            throw 'Отпечаток найденного сертификата не совпадает с выбранным.'
-        }
-        $now = [DateTime]::Now
-        $notBefore = [DateTime](Get-ActComProperty $selected 'ValidFromDate')
-        $notAfter = [DateTime](Get-ActComProperty $selected 'ValidToDate')
-        if ($notBefore -gt $now -or $notAfter -le $now) {
-            throw 'Срок действия выбранного сертификата ещё не начался или уже закончился.'
-        }
-        $session = [pscustomobject]@{
-            Store = $store
-            Certificate = $selected
-            Thumbprint = $thumbprint
-            Closed = $false
-        }
-        $transferred = $true
-        return $session
-    }
-    catch { throw ('Не удалось открыть ключ выбранного сертификата. ' + (Get-ActStageError $stage $_)) }
-    finally {
-        Close-ActComObject $matches
-        Close-ActComObject $certificates
-        if (-not $transferred) {
-            Close-ActComObject $selected
-            if ($opened) { try { [void](Invoke-ActComMethod $store 'Close') } catch { } }
-            Close-ActComObject $store
-        }
+    } catch {
+        $transport.Dispose()
+        throw
     }
 }
 
 function Invoke-ActCryptoSign {
-    param(
-        [Parameter(Mandatory = $true)][object]$Session,
-        [Parameter(Mandatory = $true)][byte[]]$PdfBytes
-    )
-    if ($Session.Closed) { throw 'Сеанс подписи уже закрыт.' }
-    $signer = $null
-    $attribute = $null
-    $attributes = $null
-    $data = $null
-    $stage = 'создание CAdESCOM.CPSigner'
+    param([Parameter(Mandatory = $true)][object]$Session, [Parameter(Mandatory = $true)][byte[]]$PdfBytes)
+    if ($Session.Closed -or $Session.Transport.IsClosed) { throw 'Сеанс подписи уже закрыт. Начните подписание заново.' }
+    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер PDF должен быть от 1 байта до 64 МиБ.' }
     try {
-        $signer = New-ActComObject 'CAdESCOM.CPSigner'
-        $stage = 'настройка CPSigner'
-        Set-ActComProperty $signer 'Certificate' $Session.Certificate
-        Set-ActComProperty $signer 'CheckCertificate' $true
-        Set-ActComProperty $signer 'Options' ([int]2)
-        $stage = 'атрибут времени подписи'
-        $attribute = New-ActComObject 'CAdESCOM.CPAttribute'
-        Set-ActComProperty $attribute 'Name' ([int]0)
-        Set-ActComProperty $attribute 'Value' ([DateTime]::Now)
-        $attributes = Get-ActComProperty $signer 'AuthenticatedAttributes2'
-        [void](Invoke-ActComMethod $attributes 'Add' @(,$attribute))
-        $stage = 'создание CAdESCOM.CadesSignedData'
-        $data = New-ActComObject 'CAdESCOM.CadesSignedData'
-        Set-ActComProperty $data 'ContentEncoding' ([int]1)
-        Set-ActComProperty $data 'Content' ([Convert]::ToBase64String($PdfBytes))
-        $stage = 'CadesSignedData.SignCades'
-        $base64 = [string](Invoke-ActComMethod $data 'SignCades' @($signer, [int]1, $true, [int]0))
-        [byte[]]$bytes = [Convert]::FromBase64String($base64)
-        if ($bytes.Length -eq 0) { throw 'КриптоПро вернул пустую подпись.' }
-        return ,$bytes
-    }
-    catch { throw ('КриптоПро не создал подпись. ' + (Get-ActStageError $stage $_)) }
-    finally {
-        Close-ActComObject $data
-        Close-ActComObject $attributes
-        Close-ActComObject $attribute
-        Close-ActComObject $signer
+        $thumbprint = Get-ActNormalizedThumbprint $Session.Thumbprint
+        $kind = [int]$Session.StoreKind
+        if ($kind -notin @(2, 100)) { throw 'Неизвестное хранилище сертификата.' }
+        $payload = Invoke-ActBridgeExchange $Session.Transport 'SIGN' $kind $thumbprint $PdfBytes $null 600000
+        $index = 0
+        [byte[]]$signature = Read-ActBridgeBlob $payload ([ref]$index)
+        Assert-ActBridgeEnd $payload $index
+        return ,$signature
+    } catch {
+        $Session.Closed = $true
+        $Session.Transport.Dispose()
+        throw
     }
 }
 
@@ -327,46 +473,22 @@ function Test-ActCryptoSignature {
         [Parameter(Mandatory = $true)][byte[]]$SignatureBytes,
         [Parameter(Mandatory = $true)][string]$Thumbprint
     )
+    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes -or $SignatureBytes.Length -le 0 -or $SignatureBytes.Length -gt $script:ActBridgeMaxBytes) {
+        throw 'Некорректный размер PDF или подписи: допустимо от 1 байта до 64 МиБ.'
+    }
     $expected = Get-ActNormalizedThumbprint $Thumbprint
-    $data = $null
-    $signers = $null
-    $signer = $null
-    $certificate = $null
-    $stage = 'создание CAdESCOM.CadesSignedData'
-    try {
-        $data = New-ActComObject 'CAdESCOM.CadesSignedData'
-        Set-ActComProperty $data 'ContentEncoding' ([int]1)
-        Set-ActComProperty $data 'Content' ([Convert]::ToBase64String($PdfBytes))
-        $stage = 'CadesSignedData.VerifyCades'
-        [void](Invoke-ActComMethod $data 'VerifyCades' @([Convert]::ToBase64String($SignatureBytes), [int]1, $true))
-        $stage = 'проверка подписанта'
-        $signers = Get-ActComProperty $data 'Signers'
-        if ([int](Get-ActComProperty $signers 'Count') -ne 1) {
-            throw 'В новой подписи неожиданное число подписантов.'
-        }
-        $signer = Get-ActComProperty $signers 'Item' @([int]1)
-        $certificate = Get-ActComProperty $signer 'Certificate'
-        $actual = [string](Get-ActComProperty $certificate 'Thumbprint')
-        if ((Get-ActNormalizedThumbprint $actual) -ne $expected) {
-            throw 'Новая подпись создана другим сертификатом.'
-        }
-    }
-    catch { throw ('Проверка новой подписи не прошла. ' + (Get-ActStageError $stage $_)) }
-    finally {
-        Close-ActComObject $certificate
-        Close-ActComObject $signer
-        Close-ActComObject $signers
-        Close-ActComObject $data
-    }
+    $payload = Invoke-ActBridgeOnce 'VERIFY' 0 $expected $PdfBytes $SignatureBytes 600000
+    if ($payload.Length -ne 2 -or $payload[0] -cne '1' -or $payload[1] -cne $expected) { throw 'Проверка подписи не подтвердила единственного выбранного подписанта.' }
 }
 
 function Close-ActCryptoSession {
     param([object]$Session)
-    if ($null -eq $Session -or $Session.Closed) { return }
-    $Session.Closed = $true
-    Close-ActComObject $Session.Certificate
-    try { [void](Invoke-ActComMethod $Session.Store 'Close') } catch { }
-    Close-ActComObject $Session.Store
+    if ($null -eq $Session) { return }
+    if (-not $Session.Closed) {
+        $Session.Closed = $true
+        try { if (-not $Session.Transport.IsClosed) { $Session.Transport.Finish(5000) } } catch { }
+    }
+    if ($null -ne $Session.Transport) { $Session.Transport.Dispose() }
     $Session.Certificate = $null
     $Session.Store = $null
 }
