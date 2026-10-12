@@ -1,0 +1,23 @@
+# User documents and electronic signatures
+*.pdf
+*.sig
+*.p7s
+*.p7m
+Подписанные_акты/
+
+# Batch logs, temporary files and packaged results
+_ActSigner_logs/
+*.log
+*.csv
+*.tmp
+*.zip
+TestResults/
+
+# Per-user preferences; the application uses LocalAppData
+settings.json
+
+# Diagnostic output and private-key export files
+ActSigner-diagnostics.txt
+*.pfx
+*.p12
+*.key

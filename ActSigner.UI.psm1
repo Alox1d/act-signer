@@ -1,0 +1,861 @@
+﻿# Windows PowerShell 5.1. The window only discovers certificates and builds a plan.
+Set-StrictMode -Version 2.0
+
+function Get-ActCertificateDetailsText {
+    param(
+        [AllowNull()][object]$CertificateInfo,
+        [int]$CertificateCount = 0,
+        [string[]]$Warnings = @(),
+        [string]$ReadError = ''
+    )
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($ReadError)) {
+        $lines.Add('Не удалось прочитать сертификаты.')
+        $lines.Add($ReadError)
+        $lines.Add('После устранения причины нажмите Обновить.')
+    }
+    elseif ($null -eq $CertificateInfo) {
+        if ($CertificateCount -gt 1) {
+            $lines.Add('Выберите свой сертификат из списка. Подписант не выбирается автоматически, если сертификатов несколько.')
+        }
+        elseif ($CertificateCount -eq 0) {
+            $lines.Add('Сертификаты, подходящие для подписи, не найдены.')
+            $lines.Add('Нажмите Обновить, чтобы повторить поиск.')
+        }
+        else { $lines.Add('Сертификат для подписи не выбран.') }
+    }
+    else {
+        $validFrom = [string]$CertificateInfo.NotBefore
+        $validTo = [string]$CertificateInfo.NotAfter
+        try { $validFrom = ([datetime]$CertificateInfo.NotBefore).ToString('dd.MM.yyyy HH:mm') } catch { }
+        try { $validTo = ([datetime]$CertificateInfo.NotAfter).ToString('dd.MM.yyyy HH:mm') } catch { }
+        $lines.Add('Владелец: ' + [string]$CertificateInfo.Subject)
+        $lines.Add('Издатель: ' + [string]$CertificateInfo.Issuer)
+        $lines.Add('Отпечаток: ' + [string]$CertificateInfo.Thumbprint)
+        $lines.Add(('Действует: с {0} по {1}' -f $validFrom, $validTo))
+        $lines.Add('Источник: ' + [string]$CertificateInfo.Source)
+    }
+    $messages = @($Warnings | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($messages.Count -gt 0) {
+        # Show diagnostic messages at the top, even in a short VM window.
+        return ((@('Диагностика:') + $messages + @('') + $lines.ToArray()) -join [Environment]::NewLine)
+    }
+    return ($lines.ToArray() -join [Environment]::NewLine)
+}
+
+function Show-ActSignerWindow {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$CertificateProvider,
+        [scriptblock]$PlanProvider
+    )
+
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        throw 'Окно подписания работает только в Windows.'
+    }
+    if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
+        throw 'Для окна подписания нужен режим STA. Запустите приложение через его файл запуска.'
+    }
+
+    $null = Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $null = Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    if ($null -eq $CertificateProvider) {
+        $CertificateProvider = { Get-ActCertificates }
+    }
+    if ($null -eq $PlanProvider) {
+        $PlanProvider = {
+            param($SourceRoot, $DestinationRoot)
+            Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot
+        }
+    }
+
+    $documentsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    if ([string]::IsNullOrWhiteSpace($documentsRoot)) {
+        $documentsRoot = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile), 'Documents')
+    }
+    $defaultOutput = [IO.Path]::Combine($documentsRoot, 'Подписанные_акты')
+    $settings = Get-ActSignerSettings
+    if (-not [string]::IsNullOrWhiteSpace($settings.SeparateOutputRoot)) {
+        $defaultOutput = $settings.SeparateOutputRoot
+    }
+    $certificateTextBuilder = ${function:Get-ActCertificateDetailsText}
+    $newLine = [Environment]::NewLine
+    $state = @{
+        Plan = $null
+        Result = $null
+        Certificates = @()
+        CertificateWarnings = @()
+        CertificateReadError = ''
+        Busy = $false
+        SuppressChanges = $false
+        SuppressGridEvents = $false
+        SeparateOutputText = $defaultOutput
+        LastSavedSource = $settings.SourceRoot
+        LastSavedSeparateOutput = $settings.SeparateOutputRoot
+        LastSavedBeside = [bool]$settings.SaveBesideSources
+        SettingsWarningShown = $false
+        Started = $false
+    }
+    $ui = @{}
+    $baseFont = New-Object System.Drawing.Font('Segoe UI', 9)
+    $titleFont = New-Object System.Drawing.Font('Segoe UI', 17, [System.Drawing.FontStyle]::Bold)
+    $toolTip = New-Object System.Windows.Forms.ToolTip
+    $toolTip.AutoPopDelay = 20000
+    $toolTip.InitialDelay = 350
+    $toolTip.ShowAlways = $true
+
+    $form = New-Object System.Windows.Forms.Form
+    $ui.Form = $form
+    $form.Text = 'Подписание актов 1.1'
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+    $form.Font = $baseFont
+    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $availableWidth = [Math]::Max(200, $workArea.Width - 32)
+    $availableHeight = [Math]::Max(200, $workArea.Height - 32)
+    $form.MinimumSize = New-Object System.Drawing.Size(
+        [Math]::Min(640, $availableWidth),
+        [Math]::Min(480, $availableHeight)
+    )
+    $form.Size = New-Object System.Drawing.Size(
+        [Math]::Min(1100, $availableWidth),
+        [Math]::Min(820, $availableHeight)
+    )
+
+    # Keep the content readable in small VM windows; scroll instead of clipping it.
+    $viewport = New-Object System.Windows.Forms.Panel
+    $viewport.Dock = 'Fill'
+    $viewport.AutoScroll = $true
+    $viewport.AutoScrollMinSize = New-Object System.Drawing.Size(880, 650)
+    [void]$form.Controls.Add($viewport)
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.Dock = 'Top'
+    $layout.MinimumSize = New-Object System.Drawing.Size(880, 650)
+    $layout.Height = [Math]::Max(650, $form.ClientSize.Height)
+    $layout.Padding = New-Object System.Windows.Forms.Padding(16, 12, 16, 12)
+    $layout.ColumnCount = 1
+    $layout.RowCount = 5
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    foreach ($height in @(52, 158, 188)) {
+        [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
+    }
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 58)))
+    [void]$viewport.Controls.Add($layout)
+    $viewport.Add_ClientSizeChanged({
+        $layout.Height = [Math]::Max(650, $viewport.ClientSize.Height)
+    }.GetNewClosure())
+
+    $heading = New-Object System.Windows.Forms.TableLayoutPanel
+    $heading.Dock = 'Fill'
+    $heading.Margin = New-Object System.Windows.Forms.Padding(0)
+    $heading.ColumnCount = 1
+    $heading.RowCount = 2
+    [void]$heading.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 29)))
+    [void]$heading.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'Подписать акты своей ЭП'
+    $title.Font = $titleFont
+    $title.Dock = 'Fill'
+    $title.Margin = New-Object System.Windows.Forms.Padding(0)
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = 'Отдельный файл .my.sig для каждого выбранного PDF.'
+    $subtitle.Dock = 'Fill'
+    $subtitle.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+    [void]$heading.Controls.Add($title, 0, 0)
+    [void]$heading.Controls.Add($subtitle, 0, 1)
+    [void]$layout.Controls.Add($heading, 0, 0)
+
+    $folderGroup = New-Object System.Windows.Forms.GroupBox
+    $folderGroup.Text = '1. Папки'
+    $folderGroup.Dock = 'Fill'
+    $folderGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
+    $folderGroup.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 7)
+    $folders = New-Object System.Windows.Forms.TableLayoutPanel
+    $folders.Dock = 'Fill'
+    $folders.ColumnCount = 3
+    $folders.RowCount = 4
+    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 125)))
+    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$folders.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 104)))
+    foreach ($height in @(30, 30, 27)) {
+        [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
+    }
+    [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $sourceLabel = New-Object System.Windows.Forms.Label
+    $sourceLabel.Text = 'Папка с актами:'
+    $sourceLabel.Dock = 'Fill'
+    $sourceLabel.TextAlign = 'MiddleLeft'
+    $sourceBox = New-Object System.Windows.Forms.TextBox
+    $ui.Source = $sourceBox
+    $sourceBox.Dock = 'Fill'
+    $sourceBox.Text = $settings.SourceRoot
+    $sourceBox.AccessibleName = 'Папка с исходными актами'
+    $sourceBrowse = New-Object System.Windows.Forms.Button
+    $ui.SourceBrowse = $sourceBrowse
+    $sourceBrowse.Text = 'Выбрать...'
+    $sourceBrowse.Dock = 'Fill'
+    $sourceBrowse.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
+    $sourceBrowse.UseVisualStyleBackColor = $true
+    [void]$folders.Controls.Add($sourceLabel, 0, 0)
+    [void]$folders.Controls.Add($sourceBox, 1, 0)
+    [void]$folders.Controls.Add($sourceBrowse, 2, 0)
+
+    $outputLabel = New-Object System.Windows.Forms.Label
+    $outputLabel.Text = 'Папка результата:'
+    $outputLabel.Dock = 'Fill'
+    $outputLabel.TextAlign = 'MiddleLeft'
+    $outputBox = New-Object System.Windows.Forms.TextBox
+    $ui.Output = $outputBox
+    $outputBox.Dock = 'Fill'
+    $outputBox.Text = $defaultOutput
+    $outputBox.AccessibleName = 'Папка для PDF и подписей'
+    $outputBrowse = New-Object System.Windows.Forms.Button
+    $ui.OutputBrowse = $outputBrowse
+    $outputBrowse.Text = 'Выбрать...'
+    $outputBrowse.Dock = 'Fill'
+    $outputBrowse.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
+    $outputBrowse.UseVisualStyleBackColor = $true
+    [void]$folders.Controls.Add($outputLabel, 0, 1)
+    [void]$folders.Controls.Add($outputBox, 1, 1)
+    [void]$folders.Controls.Add($outputBrowse, 2, 1)
+
+    $beside = New-Object System.Windows.Forms.CheckBox
+    $ui.Beside = $beside
+    $beside.Text = 'Сохранять рядом с исходниками'
+    $beside.Checked = [bool]$settings.SaveBesideSources
+    $beside.Dock = 'Fill'
+    [void]$folders.Controls.Add($beside, 1, 2)
+    $folders.SetColumnSpan($beside, 2)
+    $outputHint = New-Object System.Windows.Forms.Label
+    $ui.OutputHint = $outputHint
+    $outputHint.Text = 'В отдельную папку будут скопированы выбранные PDF и новые подписи. Структура подпапок сохранится.'
+    $outputHint.Dock = 'Fill'
+    $outputHint.AutoEllipsis = $true
+    $outputHint.ForeColor = [Drawing.SystemColors]::GrayText
+    [void]$folders.Controls.Add($outputHint, 1, 3)
+    $folders.SetColumnSpan($outputHint, 2)
+    [void]$folderGroup.Controls.Add($folders)
+    [void]$layout.Controls.Add($folderGroup, 0, 1)
+
+    $certificateGroup = New-Object System.Windows.Forms.GroupBox
+    $certificateGroup.Text = '2. Сертификат для подписи'
+    $certificateGroup.Dock = 'Fill'
+    $certificateGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
+    $certificateGroup.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 7)
+    $certificateLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $certificateLayout.Dock = 'Fill'
+    $certificateLayout.ColumnCount = 2
+    $certificateLayout.RowCount = 4
+    [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$certificateLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 112)))
+    foreach ($height in @(22, 31)) {
+        [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $height)))
+    }
+    [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$certificateLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 25)))
+    $certificateHint = New-Object System.Windows.Forms.Label
+    $certificateHint.Text = 'Показываем доступные сертификаты КриптоПро. Для повторного поиска нажмите Обновить.'
+    $certificateHint.Dock = 'Fill'
+    [void]$certificateLayout.Controls.Add($certificateHint, 0, 0)
+    $certificateLayout.SetColumnSpan($certificateHint, 2)
+    $certificateBox = New-Object System.Windows.Forms.ComboBox
+    $ui.Certificate = $certificateBox
+    $certificateBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $certificateBox.Dock = 'Fill'
+    $certificateBox.IntegralHeight = $false
+    $certificateBox.MaxDropDownItems = 10
+    $certificateBox.DropDownHeight = 230
+    $certificateBox.DropDownWidth = 900
+    $certificateBox.AccessibleName = 'Сертификат для подписания'
+    $refresh = New-Object System.Windows.Forms.Button
+    $ui.Refresh = $refresh
+    $refresh.Text = 'Обновить'
+    $refresh.Dock = 'Fill'
+    $refresh.Margin = New-Object System.Windows.Forms.Padding(7, 1, 0, 3)
+    $refresh.UseVisualStyleBackColor = $true
+    [void]$certificateLayout.Controls.Add($certificateBox, 0, 1)
+    [void]$certificateLayout.Controls.Add($refresh, 1, 1)
+    $certificateDetails = New-Object System.Windows.Forms.TextBox
+    $ui.CertificateDetails = $certificateDetails
+    $certificateDetails.Multiline = $true
+    $certificateDetails.ReadOnly = $true
+    $certificateDetails.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $certificateDetails.Dock = 'Fill'
+    $certificateDetails.BackColor = [Drawing.SystemColors]::Window
+    $certificateDetails.Text = 'Список сертификатов будет загружен при открытии окна.'
+    $certificateDetails.AccessibleName = 'Данные сертификата и диагностика'
+    [void]$certificateLayout.Controls.Add($certificateDetails, 0, 2)
+    $certificateLayout.SetColumnSpan($certificateDetails, 2)
+    $certificateStatus = New-Object System.Windows.Forms.Label
+    $ui.CertificateStatus = $certificateStatus
+    $certificateStatus.Dock = 'Fill'
+    $certificateStatus.AutoEllipsis = $true
+    $certificateStatus.TextAlign = 'MiddleLeft'
+    [void]$certificateLayout.Controls.Add($certificateStatus, 0, 3)
+    $certificateLayout.SetColumnSpan($certificateStatus, 2)
+    [void]$certificateGroup.Controls.Add($certificateLayout)
+    [void]$layout.Controls.Add($certificateGroup, 0, 2)
+
+    $actGroup = New-Object System.Windows.Forms.GroupBox
+    $actGroup.Text = '3. Акты для подписи'
+    $actGroup.Dock = 'Fill'
+    $actGroup.Padding = New-Object System.Windows.Forms.Padding(10, 20, 10, 6)
+    $actGroup.Margin = New-Object System.Windows.Forms.Padding(0)
+    $actLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $actLayout.Dock = 'Fill'
+    $actLayout.ColumnCount = 1
+    $actLayout.RowCount = 4
+    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 35)))
+    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 34)))
+    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$actLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 25)))
+    $matchHint = New-Object System.Windows.Forms.Label
+    $matchHint.Text = 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.'
+    $matchHint.Dock = 'Fill'
+    $matchHint.AutoEllipsis = $true
+    [void]$actLayout.Controls.Add($matchHint, 0, 0)
+    $toolbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $toolbar.Dock = 'Fill'
+    $toolbar.Margin = New-Object System.Windows.Forms.Padding(0)
+    $toolbar.WrapContents = $false
+    $find = New-Object System.Windows.Forms.Button
+    $ui.Find = $find
+    $find.Text = 'Найти акты'
+    $find.Size = New-Object System.Drawing.Size(130, 28)
+    $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
+    $find.UseVisualStyleBackColor = $true
+    $selectNew = New-Object System.Windows.Forms.Button
+    $ui.SelectNew = $selectNew
+    $selectNew.Text = 'Выбрать все новые'
+    $selectNew.Size = New-Object System.Drawing.Size(155, 28)
+    $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
+    $selectNew.UseVisualStyleBackColor = $true
+    $clearSelection = New-Object System.Windows.Forms.Button
+    $ui.ClearSelection = $clearSelection
+    $clearSelection.Text = 'Снять выбор'
+    $clearSelection.Size = New-Object System.Drawing.Size(115, 28)
+    $clearSelection.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 3)
+    $clearSelection.UseVisualStyleBackColor = $true
+    [void]$toolbar.Controls.Add($find)
+    [void]$toolbar.Controls.Add($selectNew)
+    [void]$toolbar.Controls.Add($clearSelection)
+    [void]$actLayout.Controls.Add($toolbar, 0, 1)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $ui.Grid = $grid
+    $grid.Dock = 'Fill'
+    $grid.BackgroundColor = [Drawing.SystemColors]::Window
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AllowUserToOrderColumns = $false
+    $grid.RowHeadersVisible = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.EditMode = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
+    $grid.RowTemplate.Height = 27
+    $grid.AccessibleName = 'Предварительный список актов'
+    $checkColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $checkColumn.Name = 'Selected'
+    $checkColumn.HeaderText = 'Выбор'
+    $checkColumn.Width = 58
+    $checkColumn.Resizable = [System.Windows.Forms.DataGridViewTriState]::False
+    $checkColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $pathColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $pathColumn.Name = 'RelativePath'
+    $pathColumn.HeaderText = 'Файл и подпапка'
+    $pathColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $pathColumn.MinimumWidth = 300
+    $pathColumn.ReadOnly = $true
+    $pathColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $statusColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $statusColumn.Name = 'Status'
+    $statusColumn.HeaderText = 'Статус'
+    $statusColumn.Width = 170
+    $statusColumn.ReadOnly = $true
+    $statusColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    [void]$grid.Columns.Add($checkColumn)
+    [void]$grid.Columns.Add($pathColumn)
+    [void]$grid.Columns.Add($statusColumn)
+    [void]$actLayout.Controls.Add($grid, 0, 2)
+    $summary = New-Object System.Windows.Forms.Label
+    $ui.Summary = $summary
+    $summary.Dock = 'Fill'
+    $summary.AutoEllipsis = $true
+    $summary.TextAlign = 'MiddleLeft'
+    $summary.Text = 'Выберите папку и нажмите Найти акты.'
+    [void]$actLayout.Controls.Add($summary, 0, 3)
+    [void]$actGroup.Controls.Add($actLayout)
+    [void]$layout.Controls.Add($actGroup, 0, 3)
+
+    $footer = New-Object System.Windows.Forms.TableLayoutPanel
+    $footer.Dock = 'Fill'
+    $footer.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
+    $footer.ColumnCount = 3
+    $footer.RowCount = 1
+    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 230)))
+    [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 102)))
+    $footerHint = New-Object System.Windows.Forms.Label
+    $footerHint.Dock = 'Fill'
+    $footerHint.Text = 'После нажатия окно закроется, подписание продолжится в консоли. КриптоПро может запросить PIN носителя.'
+    $footerHint.AutoEllipsis = $true
+    $footerHint.TextAlign = 'MiddleLeft'
+    $footerHint.ForeColor = [Drawing.SystemColors]::GrayText
+    $sign = New-Object System.Windows.Forms.Button
+    $ui.Sign = $sign
+    $sign.Text = 'Подписать'
+    $sign.Dock = 'Fill'
+    $sign.Margin = New-Object System.Windows.Forms.Padding(8, 3, 8, 3)
+    $sign.UseVisualStyleBackColor = $true
+    $sign.Enabled = $false
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Отмена'
+    $cancel.Dock = 'Fill'
+    $cancel.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 3)
+    $cancel.UseVisualStyleBackColor = $true
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    [void]$footer.Controls.Add($footerHint, 0, 0)
+    [void]$footer.Controls.Add($sign, 1, 0)
+    [void]$footer.Controls.Add($cancel, 2, 0)
+    [void]$layout.Controls.Add($footer, 0, 4)
+    $form.AcceptButton = $sign
+    $form.CancelButton = $cancel
+
+    $toolTip.SetToolTip($sourceBox, 'Можно выбрать папку или вставить путь, включая общую папку VM. Поиск включает подпапки.')
+    $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут PDF и новые .my.sig.')
+    $toolTip.SetToolTip($beside, 'Для этого режима исходная папка должна быть доступна для записи.')
+    $toolTip.SetToolTip($matchHint, $matchHint.Text)
+    $toolTip.SetToolTip($footerHint, $footerHint.Text)
+
+    $actWord = {
+        param([int]$Count)
+        $lastTwo = $Count % 100
+        if ($lastTwo -ge 11 -and $lastTwo -le 14) { return 'актов' }
+        switch ($Count % 10) {
+            1 { return 'акт' }
+            2 { return 'акта' }
+            3 { return 'акта' }
+            4 { return 'акта' }
+            default { return 'актов' }
+        }
+    }
+    $formatDate = {
+        param($Value, [switch]$WithTime)
+        try {
+            if ($WithTime) { return ([datetime]$Value).ToString('dd.MM.yyyy HH:mm') }
+            return ([datetime]$Value).ToString('dd.MM.yyyy')
+        }
+        catch { return [string]$Value }
+    }
+    $showError = {
+        param([string]$Message, [string]$Caption = 'Не удалось выполнить действие')
+        [void][System.Windows.Forms.MessageBox]::Show(
+            $ui.Form, $Message, $Caption,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+    }.GetNewClosure()
+
+    $savePreferences = {
+        if ($state.SuppressChanges) { return }
+        $source = $ui.Source.Text.Trim()
+        $separateOutput = $state.SeparateOutputText.Trim()
+        $saveBeside = [bool]$ui.Beside.Checked
+        if ([string]::Equals($source, $state.LastSavedSource, [StringComparison]::Ordinal) -and
+            [string]::Equals($separateOutput, $state.LastSavedSeparateOutput, [StringComparison]::Ordinal) -and
+            $saveBeside -eq $state.LastSavedBeside) { return }
+        $saved = $false
+        try {
+            $saved = Save-ActSignerSettings -SourceRoot $source -SeparateOutputRoot $separateOutput -SaveBesideSources $saveBeside
+        }
+        catch { }
+        if ($saved) {
+            $state.LastSavedSource = $source
+            $state.LastSavedSeparateOutput = $separateOutput
+            $state.LastSavedBeside = $saveBeside
+        }
+        elseif (-not $state.SettingsWarningShown) {
+            $state.SettingsWarningShown = $true
+            Write-Warning 'Не удалось запомнить папки. Подписание можно продолжить; при следующем запуске потребуется выбрать папку снова.' -WarningAction Continue
+        }
+    }.GetNewClosure()
+
+    $syncAction = {
+        if ($state.SuppressGridEvents) { return }
+        $selectedCount = 0
+        $existingCount = 0
+        $newCount = 0
+        foreach ($row in $ui.Grid.Rows) {
+            if ($null -eq $row.Tag) { continue }
+            if ([bool]$row.Tag.ExistingSignature) { $existingCount++ }
+            else {
+                $newCount++
+                if ([bool]$row.Cells[0].Value) { $selectedCount++ }
+            }
+        }
+        $certificateIndex = $ui.Certificate.SelectedIndex
+        $hasCertificate = $certificateIndex -ge 0 -and $certificateIndex -lt $state.Certificates.Count
+        $ui.Sign.Text = 'Подписать {0} {1}' -f $selectedCount, (& $actWord $selectedCount)
+        $ui.Sign.Enabled = (-not $state.Busy) -and $null -ne $state.Plan -and $selectedCount -gt 0 -and $hasCertificate
+        $ui.Find.Enabled = (-not $state.Busy) -and
+            (-not [string]::IsNullOrWhiteSpace($ui.Source.Text)) -and
+            (-not [string]::IsNullOrWhiteSpace($ui.Output.Text))
+        $ui.SelectNew.Enabled = (-not $state.Busy) -and $newCount -gt 0
+        $ui.ClearSelection.Enabled = (-not $state.Busy) -and $selectedCount -gt 0
+        $ui.Refresh.Enabled = -not $state.Busy
+        $ui.Certificate.Enabled = (-not $state.Busy) -and $state.Certificates.Count -gt 0
+        $ui.Source.Enabled = -not $state.Busy
+        $ui.SourceBrowse.Enabled = -not $state.Busy
+        $ui.Beside.Enabled = -not $state.Busy
+        $ui.Output.Enabled = (-not $state.Busy) -and (-not $ui.Beside.Checked)
+        $ui.OutputBrowse.Enabled = $ui.Output.Enabled
+        $ui.Grid.Enabled = -not $state.Busy
+        if ($null -ne $state.Plan) {
+            $text = 'Найдено: {0}   |   Выбрано: {1}   |   Подпись уже есть: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
+            $skippedCount = @($state.Plan.SkippedReparsePoints).Count
+            if ($skippedCount -gt 0) { $text += '   |   Пропущено ссылок: ' + $skippedCount }
+            if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие акты в этой папке и её подпапках не найдены.' }
+            $ui.Summary.Text = $text
+            $toolTip.SetToolTip($ui.Summary, $text)
+        }
+    }.GetNewClosure()
+
+    $invalidatePlan = {
+        if ($state.SuppressChanges) { return }
+        $state.Plan = $null
+        $state.SuppressGridEvents = $true
+        try { $ui.Grid.Rows.Clear() }
+        finally { $state.SuppressGridEvents = $false }
+        $ui.Summary.Text = 'Папки изменены. Нажмите Найти акты, чтобы проверить новый список.'
+        $toolTip.SetToolTip($ui.Summary, $ui.Summary.Text)
+        & $syncAction
+    }.GetNewClosure()
+
+    $syncOutputToSource = {
+        $wasSuppressed = $state.SuppressChanges
+        $state.SuppressChanges = $true
+        try {
+            if ($ui.Beside.Checked) {
+                $ui.Output.Text = $ui.Source.Text
+                $ui.OutputHint.Text = 'Каждая новая .my.sig будет сохранена в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.'
+            }
+            else {
+                $ui.Output.Text = $state.SeparateOutputText
+                $ui.OutputHint.Text = 'В отдельную папку будут скопированы выбранные PDF и новые подписи. Структура подпапок сохранится.'
+            }
+        }
+        finally { $state.SuppressChanges = $wasSuppressed }
+        $toolTip.SetToolTip($ui.OutputHint, $ui.OutputHint.Text)
+    }.GetNewClosure()
+
+    $showCertificate = {
+        $index = $ui.Certificate.SelectedIndex
+        $cert = $null
+        if ($index -ge 0 -and $index -lt $state.Certificates.Count) { $cert = $state.Certificates[$index] }
+        $ui.CertificateDetails.Text = & $certificateTextBuilder -CertificateInfo $cert -CertificateCount $state.Certificates.Count `
+            -Warnings $state.CertificateWarnings -ReadError $state.CertificateReadError
+        $ui.CertificateDetails.SelectionStart = 0
+        $ui.CertificateDetails.SelectionLength = 0
+        $ui.CertificateDetails.ScrollToCaret()
+        & $syncAction
+    }.GetNewClosure()
+
+    $refreshCertificates = {
+        if ($state.Busy) { return }
+        $previous = $null
+        if ($ui.Certificate.SelectedIndex -ge 0 -and $ui.Certificate.SelectedIndex -lt $state.Certificates.Count) {
+            $previous = $state.Certificates[$ui.Certificate.SelectedIndex]
+        }
+        $state.Busy = $true
+        $state.Certificates = @()
+        $state.CertificateWarnings = @()
+        $state.CertificateReadError = ''
+        $ui.Certificate.Items.Clear()
+        $ui.Certificate.SelectedIndex = -1
+        $ui.CertificateDetails.Text = 'Читаем сертификаты из доступных хранилищ...'
+        $ui.CertificateStatus.Text = ''
+        $ui.Refresh.Text = 'Чтение...'
+        $ui.Form.UseWaitCursor = $true
+        & $syncAction
+        $ui.Form.Refresh()
+        try {
+            $discovery = & $CertificateProvider
+            if ($null -eq $discovery) { throw 'Список сертификатов не получен.' }
+            $state.Certificates = @($discovery.Certificates | Where-Object { $null -ne $_ })
+            $state.CertificateWarnings = @($discovery.Warnings | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            $ui.Certificate.BeginUpdate()
+            try {
+                foreach ($cert in $state.Certificates) {
+                    $name = [string]$cert.DisplayName
+                    if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$cert.Subject }
+                    $label = '{0} | до {1} | {2}' -f $name, (& $formatDate $cert.NotAfter), [string]$cert.Source
+                    [void]$ui.Certificate.Items.Add($label)
+                }
+            }
+            finally { $ui.Certificate.EndUpdate() }
+
+            $restoreIndex = -1
+            if ($state.Certificates.Count -eq 1) { $restoreIndex = 0 }
+            elseif ($null -ne $previous) {
+                $matches = @()
+                for ($i = 0; $i -lt $state.Certificates.Count; $i++) {
+                    $candidate = $state.Certificates[$i]
+                    if ([string]$candidate.Thumbprint -eq [string]$previous.Thumbprint -and
+                        [string]$candidate.StoreKind -eq [string]$previous.StoreKind -and
+                        [string]$candidate.Source -eq [string]$previous.Source) {
+                        $matches += $i
+                    }
+                }
+                if ($matches.Count -eq 1) { $restoreIndex = $matches[0] }
+            }
+            $ui.Certificate.SelectedIndex = $restoreIndex
+            $warnings = $state.CertificateWarnings
+            if ($state.Certificates.Count -eq 0) {
+                $statusText = 'Сертификаты для подписи не найдены.'
+                $ui.CertificateStatus.ForeColor = [Drawing.Color]::Firebrick
+            }
+            elseif ($warnings.Count -gt 0) {
+                $statusText = 'Найдено сертификатов: {0}. Сообщения диагностики показаны выше.' -f $state.Certificates.Count
+                $ui.CertificateStatus.ForeColor = [Drawing.Color]::DarkGoldenrod
+            }
+            else {
+                $statusText = 'Доступно сертификатов: ' + $state.Certificates.Count
+                if ($state.Certificates.Count -gt 1 -and $restoreIndex -lt 0) { $statusText += '. Выберите подписанта.' }
+                $ui.CertificateStatus.ForeColor = [Drawing.SystemColors]::ControlText
+            }
+            $ui.CertificateStatus.Text = $statusText
+            $fullStatus = $statusText
+            if ($warnings.Count -gt 0) {
+                $fullStatus += $newLine + ($warnings -join $newLine)
+            }
+            $toolTip.SetToolTip($ui.CertificateStatus, $fullStatus)
+            & $showCertificate
+        }
+        catch {
+            $state.Certificates = @()
+            $state.CertificateReadError = $_.Exception.Message
+            $ui.Certificate.Items.Clear()
+            & $showCertificate
+            $ui.CertificateStatus.Text = 'Сертификаты не загружены. Причина показана выше.'
+            $ui.CertificateStatus.ForeColor = [Drawing.Color]::Firebrick
+            $toolTip.SetToolTip($ui.CertificateStatus, $_.Exception.Message)
+        }
+        finally {
+            $state.Busy = $false
+            $ui.Refresh.Text = 'Обновить'
+            $ui.Form.UseWaitCursor = $false
+            & $syncAction
+        }
+    }.GetNewClosure()
+
+    $browseFolder = {
+        param([bool]$ForOutput)
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        try {
+            $dialog.ShowNewFolderButton = $false
+            $dialog.RootFolder = [Environment+SpecialFolder]::Desktop
+            if ($ForOutput) {
+                $dialog.Description = 'Выберите папку результата. Имя новой папки можно дописать в поле пути.'
+                $candidate = $ui.Output.Text.Trim()
+            }
+            else {
+                $dialog.Description = 'Выберите папку с актами. Будут просмотрены и её подпапки.'
+                $candidate = $ui.Source.Text.Trim()
+            }
+            if ([IO.Directory]::Exists($candidate)) { $dialog.SelectedPath = $candidate }
+            elseif ($ForOutput -and [IO.Directory]::Exists($documentsRoot)) { $dialog.SelectedPath = $documentsRoot }
+            if ($dialog.ShowDialog($ui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+                if ($ForOutput) { $ui.Output.Text = $dialog.SelectedPath }
+                else { $ui.Source.Text = $dialog.SelectedPath }
+                & $savePreferences
+            }
+        }
+        catch { & $showError $_.Exception.Message 'Не удалось выбрать папку' }
+        finally { $dialog.Dispose() }
+    }.GetNewClosure()
+
+    $findActs = {
+        if ($state.Busy) { return }
+        $sourceRoot = $ui.Source.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
+            & $showError 'Выберите папку с актами.'
+            [void]$ui.Source.Focus()
+            return
+        }
+        # Use the mode directly. With the same root, Core keeps each signature
+        # next to its own source PDF, including PDFs in different subfolders.
+        $destinationRoot = if ($ui.Beside.Checked) { $sourceRoot } else { $ui.Output.Text.Trim() }
+        if ([string]::IsNullOrWhiteSpace($destinationRoot)) {
+            & $showError 'Укажите папку результата.'
+            [void]$ui.Output.Focus()
+            return
+        }
+        & $savePreferences
+        & $invalidatePlan
+        $state.Busy = $true
+        $ui.Form.UseWaitCursor = $true
+        $ui.Find.Text = 'Поиск...'
+        $ui.Summary.Text = 'Ищем акты в выбранной папке и её подпапках...'
+        & $syncAction
+        $ui.Form.Refresh()
+        try {
+            $plan = & $PlanProvider $sourceRoot $destinationRoot
+            if ($null -eq $plan) { throw 'Не удалось построить список актов.' }
+            $state.SuppressGridEvents = $true
+            $ui.Grid.SuspendLayout()
+            try {
+                foreach ($item in @($plan.Items)) {
+                    if ($null -eq $item) { continue }
+                    $existing = [bool]$item.ExistingSignature
+                    $status = 'Новая подпись'
+                    if ($existing) { $status = 'Подпись уже есть' }
+                    $rowIndex = $ui.Grid.Rows.Add([object[]]@((-not $existing), [string]$item.RelativePath, $status))
+                    $row = $ui.Grid.Rows[$rowIndex]
+                    $row.Tag = $item
+                    $row.Cells[0].ReadOnly = $existing
+                    $row.Cells[1].ToolTipText = 'Исходный PDF: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
+                    $row.Cells[2].ToolTipText = [string]$item.SignaturePath
+                    if ($existing) {
+                        $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText
+                        $row.Cells[0].ToolTipText = 'Существующие .my.sig не перезаписываются.'
+                    }
+                }
+            }
+            finally {
+                $ui.Grid.ResumeLayout()
+                $state.SuppressGridEvents = $false
+            }
+            $state.Plan = $plan
+            $ui.Grid.ClearSelection()
+        }
+        catch {
+            $state.Plan = $null
+            $state.SuppressGridEvents = $true
+            try { $ui.Grid.Rows.Clear() }
+            finally { $state.SuppressGridEvents = $false }
+            $ui.Summary.Text = 'Поиск не завершён. Проверьте пути и доступ к исходной папке.'
+            & $showError $_.Exception.Message 'Не удалось найти акты'
+        }
+        finally {
+            $state.Busy = $false
+            $ui.Form.UseWaitCursor = $false
+            $ui.Find.Text = 'Найти акты'
+            & $syncAction
+        }
+    }.GetNewClosure()
+
+    $sourceBox.Add_TextChanged({
+        if ($state.SuppressChanges) { return }
+        & $syncOutputToSource
+        & $invalidatePlan
+    }.GetNewClosure())
+    $outputBox.Add_TextChanged({
+        if ($state.SuppressChanges) { return }
+        if (-not $ui.Beside.Checked) { $state.SeparateOutputText = $ui.Output.Text }
+        & $invalidatePlan
+    }.GetNewClosure())
+    $beside.Add_CheckedChanged({
+        if ($state.SuppressChanges) { return }
+        if ($ui.Beside.Checked) { $state.SeparateOutputText = $ui.Output.Text }
+        & $syncOutputToSource
+        & $invalidatePlan
+        & $savePreferences
+    }.GetNewClosure())
+    $sourceBox.Add_Leave({ & $savePreferences }.GetNewClosure())
+    $outputBox.Add_Leave({ & $savePreferences }.GetNewClosure())
+    $sourceBrowse.Add_Click({ & $browseFolder $false }.GetNewClosure())
+    $outputBrowse.Add_Click({ & $browseFolder $true }.GetNewClosure())
+    $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())
+    $certificateBox.Add_SelectedIndexChanged({ & $showCertificate }.GetNewClosure())
+    $find.Add_Click({ & $findActs }.GetNewClosure())
+    $grid.Add_CurrentCellDirtyStateChanged({
+        if ($ui.Grid.IsCurrentCellDirty) {
+            [void]$ui.Grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+        }
+    }.GetNewClosure())
+    $grid.Add_CellValueChanged({
+        param($sender, $eventArgs)
+        if ($eventArgs.RowIndex -ge 0 -and $eventArgs.ColumnIndex -eq 0) { & $syncAction }
+    }.GetNewClosure())
+    $selectNew.Add_Click({
+        $state.SuppressGridEvents = $true
+        try {
+            foreach ($row in $ui.Grid.Rows) {
+                if ($null -ne $row.Tag -and -not [bool]$row.Tag.ExistingSignature) { $row.Cells[0].Value = $true }
+            }
+        }
+        finally { $state.SuppressGridEvents = $false }
+        & $syncAction
+    }.GetNewClosure())
+    $clearSelection.Add_Click({
+        $state.SuppressGridEvents = $true
+        try { foreach ($row in $ui.Grid.Rows) { $row.Cells[0].Value = $false } }
+        finally { $state.SuppressGridEvents = $false }
+        & $syncAction
+    }.GetNewClosure())
+    $sign.Add_Click({
+        try {
+            if ($state.Busy -or $null -eq $state.Plan) { return }
+            if ($ui.Grid.IsCurrentCellDirty) {
+                [void]$ui.Grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+            }
+            [void]$ui.Grid.EndEdit()
+            $certificateIndex = $ui.Certificate.SelectedIndex
+            if ($certificateIndex -lt 0 -or $certificateIndex -ge $state.Certificates.Count) {
+                throw 'Выберите сертификат для подписи.'
+            }
+            $selectedItems = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($row in $ui.Grid.Rows) {
+                if ($null -ne $row.Tag -and -not [bool]$row.Tag.ExistingSignature -and [bool]$row.Cells[0].Value) {
+                    $selectedItems.Add($row.Tag)
+                }
+            }
+            if ($selectedItems.Count -eq 0) { throw 'Отметьте хотя бы один акт без существующей подписи .my.sig.' }
+            $selectedPlan = [pscustomobject]@{
+                Root = $state.Plan.Root
+                OutputRoot = $state.Plan.OutputRoot
+                SeparateOutput = [bool]$state.Plan.SeparateOutput
+                Items = @($selectedItems.ToArray())
+                SkippedReparsePoints = @($state.Plan.SkippedReparsePoints)
+            }
+            $state.Result = [pscustomobject]@{
+                Plan = $selectedPlan
+                CertificateInfo = $state.Certificates[$certificateIndex]
+                CopyOriginals = [bool]$state.Plan.SeparateOutput
+            }
+            $ui.Form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $ui.Form.Close()
+        }
+        catch { & $showError $_.Exception.Message 'Не удалось начать подписание' }
+    }.GetNewClosure())
+    $form.Add_Shown({
+        if (-not $state.Started) {
+            $state.Started = $true
+            & $refreshCertificates
+            [void]$ui.Source.Focus()
+        }
+    }.GetNewClosure())
+    $form.Add_FormClosing({ & $savePreferences }.GetNewClosure())
+
+    & $syncOutputToSource
+    & $syncAction
+    try {
+        [void]$form.ShowDialog()
+        return $state.Result
+    }
+    finally {
+        $form.Dispose()
+        $toolTip.Dispose()
+        $titleFont.Dispose()
+        $baseFont.Dispose()
+    }
+}
+
+Export-ModuleMember -Function Show-ActSignerWindow
