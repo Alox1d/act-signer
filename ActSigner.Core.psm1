@@ -493,7 +493,7 @@ function Invoke-ActBatch {
             $hash = ''
             $stage = 'Подготовка'
             try {
-                if($conflictingTargets.ContainsKey([string]$item.SignaturePath)) { throw 'Несколько выбранных актов имеют одинаковое имя подписи. Выберите формат с именем акта или разложите акты по отдельным папкам.' }
+                if($conflictingTargets.ContainsKey([string]$item.SignaturePath)) { throw 'Несколько выбранных актов имеют одинаковое имя подписи. Разложите разные акты по отдельным папкам: формат с именем акта различает имена, но соседние подписи также проверяются для каждого PDF.' }
                 $sourceState = Open-ActReadState -Path $item.SourcePath -RequirePdf
                 $states.Add($sourceState)
                 $hash = $sourceState.Hash
