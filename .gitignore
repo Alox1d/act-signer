@@ -35,3 +35,8 @@ ui-test-artifacts/
 # Synthetic native-console regression reports
 console-test-artifacts/
 entry-test-artifacts/
+
+# Synthetic update checks and release build output
+update-test-artifacts/
+release-artifacts/
+release-output/
