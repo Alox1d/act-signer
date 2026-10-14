@@ -11,9 +11,13 @@ Windows Script Host, действующий сертификат ГОСТ-2012 �
 
 1. Полностью распакуйте CSPSigner-VERSION.zip и откройте Start.cmd.
 2. Укажите размещение результата, сертификат и формат имени.
-3. Выберите исходную папку и нажмите Найти файлы или Выбрать файлы...
+3. Выберите папку (поиск начнётся сразу) или Выбрать файлы...
 4. Проверьте список и нажмите Проверить и подписать.
 5. PIN вводите в штатном окне КриптоПро или токена.
+
+Ctrl/Shift выделяет строки; пробел меняет галочки группы.
+Выбрать все / Снять все меняют весь список. Обновить список сохраняет выбор.
+Архивы при поиске папки без галочек; выбранные явно файлы отмечены.
 
 Формат файлов произвольный, размер одного файла - до 64 МиБ.
 По умолчанию: report.docx -> report.docx_ivanov.sig.
@@ -32,9 +36,11 @@ Windows Script Host, действующий сертификат ГОСТ-2012 �
 ENGLISH QUICK START (APPLICATION UI IS IN RUSSIAN)
 1. Extract CSPSigner-VERSION.zip and open Start.cmd.
 2. Choose output mode, certificate and naming format.
-3. Choose a folder and click Найти файлы (find files), or select files.
+3. Choose a folder to scan it automatically, or select individual files.
 4. Review the list and click Проверить и подписать (check and sign).
 5. Enter the PIN in the standard CryptoPro or token dialog.
+Ctrl/Shift highlights rows; Space toggles their checkboxes.
+Folder archives start unchecked; explicitly picked files start checked.
 
 Requires CryptoPro CSP, local CAdESCOM, Windows Script Host,
 Windows PowerShell 5.1 and a valid GOST-2012 certificate/private key.

@@ -48,7 +48,8 @@ function Show-ActSignerWindow {
     param(
         [scriptblock]$CertificateProvider,
         [scriptblock]$PlanProvider,
-        [scriptblock]$FilePickerProvider
+        [scriptblock]$FilePickerProvider,
+        [scriptblock]$FolderPickerProvider
     )
 
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
@@ -89,6 +90,22 @@ function Show-ActSignerWindow {
                 return @()
             }
             finally { $dialog.Dispose() }
+        }
+    }
+
+    if($null -eq $FolderPickerProvider){
+        $FolderPickerProvider={
+            param($Owner,$InitialDirectory,[bool]$ForOutput,$DocumentsRoot)
+            $dialog=New-Object System.Windows.Forms.FolderBrowserDialog
+            try{
+                $dialog.ShowNewFolderButton=$false
+                $dialog.RootFolder=[Environment+SpecialFolder]::Desktop
+                $dialog.Description=if($ForOutput){'Выберите папку результата. Имя новой папки можно дописать в поле пути.'}else{'Выберите папку с файлами. Будут просмотрены и её подпапки.'}
+                if([IO.Directory]::Exists($InitialDirectory)){$dialog.SelectedPath=$InitialDirectory}
+                elseif($ForOutput -and [IO.Directory]::Exists($DocumentsRoot)){$dialog.SelectedPath=$DocumentsRoot}
+                if($dialog.ShowDialog($Owner) -eq [Windows.Forms.DialogResult]::OK){return $dialog.SelectedPath}
+                return ''
+            }finally{$dialog.Dispose()}
         }
     }
 
@@ -327,15 +344,15 @@ function Show-ActSignerWindow {
     $toolbar.Margin = New-Object System.Windows.Forms.Padding(0)
     $toolbar.WrapContents = $true
     $toolbar.TabIndex = 0
-    $find = & $makeButton 'Найти файлы' 130 30
+    $find = & $makeButton 'Обновить список' 145 30
     $ui.Find = $find
     $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
     $find.TabIndex = 0
-    $selectNew = & $makeButton 'Выбрать все доступные' 155 30
+    $selectNew = & $makeButton 'Выбрать все' 105 30
     $ui.SelectNew = $selectNew
     $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
     $selectNew.TabIndex = 2
-    $clearSelection = & $makeButton 'Снять выбор' 115 30
+    $clearSelection = & $makeButton 'Снять все' 100 30
     $ui.ClearSelection = $clearSelection
     $clearSelection.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
     $clearSelection.TabIndex = 3
@@ -385,7 +402,7 @@ function Show-ActSignerWindow {
     $grid.AllowUserToOrderColumns = $false
     $grid.RowHeadersVisible = $false
     $grid.AutoGenerateColumns = $false
-    $grid.MultiSelect = $false
+    $grid.MultiSelect = $true
     $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
     $grid.EditMode = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
     $grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::AllCellsExceptHeaders
@@ -446,7 +463,7 @@ function Show-ActSignerWindow {
     $summary.Margin = New-Object System.Windows.Forms.Padding(0)
     $summary.AutoEllipsis = $true
     $summary.TextAlign = 'MiddleLeft'
-    $summary.Text = 'Выберите папку и нажмите Найти файлы.'
+    $summary.Text = 'Выберите папку или отдельные файлы.'
     $summary.AccessibleName = 'Итоги поиска и выбора файлов'
     $sign = & $makeButton 'Проверить и подписать' 210 34
     $ui.Sign = $sign
@@ -468,10 +485,11 @@ function Show-ActSignerWindow {
     $form.AcceptButton = $sign
     $form.CancelButton = $cancel
 
-    $toolTip.SetToolTip($sourceBox, 'Выберите папку или вставьте путь. Кнопка Найти файлы просматривает её и подпапки. Для отдельных файлов используйте Выбрать файлы.')
+    $toolTip.SetToolTip($sourceBox, 'После выбора папки список строится автоматически. Вставленный путь подтвердите Enter. Для отдельных файлов используйте Выбрать файлы.')
     $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут копии файлов и новые подписи.')
     $toolTip.SetToolTip($beside, 'Каждая новая подпись сохраняется в той же подпапке, где найден её исходный файл. Подпапки должны быть доступны для записи.')
-    $toolTip.SetToolTip($find, 'Просмотреть все обычные файлы в папке и подпапках. Подписи, временные файлы и журналы CSPSigner пропускаются.')
+    $toolTip.SetToolTip($find, 'Повторить поиск в выбранной папке или обновить явно выбранные файлы. Ваши галочки сохраняются. Архивы при поиске папки изначально не отмечены.')
+    $toolTip.SetToolTip($grid, 'Ctrl/Shift - выделить несколько строк. Пробел меняет галочки выделенной группы. Действия группы также доступны по правой кнопке мыши.')
     $toolTip.SetToolTip($pickFiles, 'Выбрать один или несколько файлов любого формата. Будут добавлены только выбранные файлы.')
     $toolTip.SetToolTip($details, 'Полные данные выбранного сертификата и сообщения диагностики.')
     $sign.AccessibleDescription = 'Сначала проверим соседние подписи. Уже подписанные выбранным сертификатом файлы будут пропущены. Для остальных создадим новую подпись. Обработка продолжится в консоли; КриптоПро может запросить PIN носителя.'
@@ -569,7 +587,7 @@ function Show-ActSignerWindow {
         $state.SuppressGridEvents = $true
         try { $ui.Grid.Rows.Clear() }
         finally { $state.SuppressGridEvents = $false }
-        $ui.Summary.Text = 'Выбор изменён. Найдите файлы в папке или выберите их отдельно.'
+        $ui.Summary.Text = 'Параметры изменены. Обновите список или выберите файлы.'
         $toolTip.SetToolTip($ui.Summary, $ui.Summary.Text)
         & $syncAction
     }.GetNewClosure()
@@ -750,33 +768,24 @@ function Show-ActSignerWindow {
 
     $browseFolder = {
         param([bool]$ForOutput)
-        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-        try {
-            $dialog.ShowNewFolderButton = $false
-            $dialog.RootFolder = [Environment+SpecialFolder]::Desktop
-            if ($ForOutput) {
-                $dialog.Description = 'Выберите папку результата. Имя новой папки можно дописать в поле пути.'
-                $candidate = $ui.Output.Text.Trim()
-            }
-            else {
-                $dialog.Description = 'Выберите папку с файлами. Будут просмотрены и её подпапки.'
-                $candidate = $ui.Source.Text.Trim()
-            }
-            if ([IO.Directory]::Exists($candidate)) { $dialog.SelectedPath = $candidate }
-            elseif ($ForOutput -and [IO.Directory]::Exists($documentsRoot)) { $dialog.SelectedPath = $documentsRoot }
-            if ($dialog.ShowDialog($ui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
-                if ($ForOutput) { $ui.Output.Text = $dialog.SelectedPath }
-                else { $ui.Source.Text = $dialog.SelectedPath }
-                & $savePreferences
-            }
-        }
-        catch { & $showError $_.Exception.Message 'Не удалось выбрать папку' }
-        finally { $dialog.Dispose() }
+        try{
+            $candidate=if($ForOutput){$ui.Output.Text.Trim()}else{$ui.Source.Text.Trim()}
+            $chosen=[string](& $FolderPickerProvider $ui.Form $candidate $ForOutput $documentsRoot)
+            if([string]::IsNullOrWhiteSpace($chosen)){return $false}
+            if($ForOutput){$ui.Output.Text=$chosen}else{$ui.Source.Text=$chosen}
+            & $savePreferences
+            return $true
+        }catch{& $showError $_.Exception.Message 'Не удалось выбрать папку';return $false}
     }.GetNewClosure()
 
     $findActs = {
-        param([bool]$ScanFolder = $true)
+        param([bool]$ScanFolder = $true,[bool]$PreserveSelection = $false)
         if ($state.Busy) { return }
+        $previousChecks=@{}
+        if($PreserveSelection){
+            [void]$ui.Grid.EndEdit()
+            foreach($row in $ui.Grid.Rows){if($null -ne $row.Tag){$previousChecks[[string]$row.Tag.SourcePath]=[bool]$row.Cells[0].Value}}
+        }
         if ($ScanFolder) { $state.SourceFiles = @(); $state.Recurse = $true }
         $sourceRoot = $ui.Source.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
@@ -823,10 +832,14 @@ function Show-ActSignerWindow {
                     if ($null -ne $item.PSObject.Properties['NeighborSignatureCount']) { $neighborCount = [int]$item.NeighborSignatureCount }
                     if ($neighborCount -gt 0) { $status = 'Проверить подписи (' + $neighborCount + ')'  }
                     if ($existing) { $status = 'Проверить подпись' }
-                    $rowIndex = $ui.Grid.Rows.Add([object[]]@((-not $existing), [string]$item.RelativePath, $status))
+                    $archive=[IO.Path]::GetExtension([string]$item.SourcePath).ToLowerInvariant() -in @('.zip','.7z','.rar','.tar','.gz','.bz2','.xz','.tgz','.tbz','.tbz2','.txz','.zst','.cab','.iso')
+                    $checked=(-not $ScanFolder) -or ((-not $existing) -and (-not $archive))
+                    if($previousChecks.ContainsKey([string]$item.SourcePath)){$checked=[bool]$previousChecks[[string]$item.SourcePath]}
+                    $rowIndex = $ui.Grid.Rows.Add([object[]]@($checked, [string]$item.RelativePath, $status))
                     $row = $ui.Grid.Rows[$rowIndex]
                     $row.Tag = $item
                     $row.Cells[0].ReadOnly = $false
+                    if($archive -and $ScanFolder){$row.Cells[0].ToolTipText='При поиске папки архивы изначально без галочки. При необходимости отметьте файл вручную или выберите его явно.'}
                     $row.Cells[1].ToolTipText = 'Исходный файл: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
                     $row.Cells[2].ToolTipText = [string]$item.SignaturePath
                     if (-not $existing -and $neighborCount -gt 0) {
@@ -856,7 +869,7 @@ function Show-ActSignerWindow {
         finally {
             $state.Busy = $false
             $ui.Form.UseWaitCursor = $false
-            $ui.Find.Text = 'Найти файлы'
+            $ui.Find.Text = 'Обновить список'
             & $syncAction
         }
     }.GetNewClosure()
@@ -882,12 +895,16 @@ function Show-ActSignerWindow {
     $naming.Add_SelectedIndexChanged({ & $invalidatePlan; & $savePreferences }.GetNewClosure())
     $sourceBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $outputBox.Add_Leave({ & $savePreferences }.GetNewClosure())
-    $sourceBrowse.Add_Click({ & $browseFolder $false }.GetNewClosure())
-    $outputBrowse.Add_Click({ & $browseFolder $true }.GetNewClosure())
+    $sourceBrowse.Add_Click({if(& $browseFolder $false){& $findActs $true}}.GetNewClosure())
+    $sourceBox.Add_KeyDown({
+        param($sender,$eventArgs)
+        if($eventArgs.KeyCode -eq [Windows.Forms.Keys]::Enter){$eventArgs.Handled=$true;$eventArgs.SuppressKeyPress=$true;& $findActs $true}
+    }.GetNewClosure())
+    $outputBrowse.Add_Click({ [void](& $browseFolder $true) }.GetNewClosure())
     $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())
     $details.Add_Click({ & $openCertificateDetails }.GetNewClosure())
     $certificateBox.Add_SelectedIndexChanged({ & $invalidatePlan; & $showCertificate }.GetNewClosure())
-    $find.Add_Click({ & $findActs $true }.GetNewClosure())
+    $find.Add_Click({ & $findActs (@($state.SourceFiles).Count -eq 0) $true }.GetNewClosure())
     $pickFiles.Add_Click({
         if ($state.Busy) { return }
         try {
@@ -913,21 +930,47 @@ function Show-ActSignerWindow {
         param($sender, $eventArgs)
         if ($eventArgs.RowIndex -ge 0 -and $eventArgs.ColumnIndex -eq 0) { & $syncAction }
     }.GetNewClosure())
-    $selectNew.Add_Click({
-        $state.SuppressGridEvents = $true
-        try {
-            foreach ($row in $ui.Grid.Rows) {
-                if ($null -ne $row.Tag) { $row.Cells[0].Value = $true }
-            }
+    $setRowChecks={
+        param([bool]$Check,[bool]$SelectedOnly=$false)
+        if($state.Busy -or $null -eq $state.Plan){return}
+        $state.SuppressGridEvents=$true
+        try{
+            if($ui.Grid.IsCurrentCellDirty){[void]$ui.Grid.CommitEdit([Windows.Forms.DataGridViewDataErrorContexts]::Commit)}
+            [void]$ui.Grid.EndEdit()
+            $rows=if($SelectedOnly){@($ui.Grid.SelectedRows)}else{@($ui.Grid.Rows)}
+            foreach($row in $rows){if($null -ne $row.Tag){$row.Cells[0].Value=$Check}}
+        }finally{$state.SuppressGridEvents=$false}
+        & $syncAction
+    }.GetNewClosure()
+    $selectNew.Add_Click({& $setRowChecks $true}.GetNewClosure())
+    $clearSelection.Add_Click({& $setRowChecks $false}.GetNewClosure())
+    $grid.Add_KeyDown({
+        param($sender,$eventArgs)
+        if($eventArgs.KeyCode -eq [Windows.Forms.Keys]::Space -and $eventArgs.Modifiers -eq [Windows.Forms.Keys]::None -and $ui.Grid.SelectedRows.Count -gt 0){
+            $eventArgs.Handled=$true;$eventArgs.SuppressKeyPress=$true
+            $check=@($ui.Grid.SelectedRows | Where-Object {-not [bool]$_.Cells[0].Value}).Count -gt 0
+            & $setRowChecks $check $true
         }
-        finally { $state.SuppressGridEvents = $false }
-        & $syncAction
     }.GetNewClosure())
-    $clearSelection.Add_Click({
-        $state.SuppressGridEvents = $true
-        try { foreach ($row in $ui.Grid.Rows) { $row.Cells[0].Value = $false } }
-        finally { $state.SuppressGridEvents = $false }
-        & $syncAction
+    $groupMenu=New-Object Windows.Forms.ContextMenuStrip
+    $groupMenu.AccessibleName='Галочки выделенных файлов'
+    $markGroup=New-Object Windows.Forms.ToolStripMenuItem('Отметить выделенные')
+    $unmarkGroup=New-Object Windows.Forms.ToolStripMenuItem('Снять галочки с выделенных')
+    [void]$groupMenu.Items.Add($markGroup);[void]$groupMenu.Items.Add($unmarkGroup)
+    $markGroup.Add_Click({& $setRowChecks $true $true}.GetNewClosure())
+    $unmarkGroup.Add_Click({& $setRowChecks $false $true}.GetNewClosure())
+    $groupMenu.Add_Opening({
+        param($sender,$eventArgs)
+        $enabled=(-not $state.Busy) -and $null -ne $state.Plan -and $ui.Grid.SelectedRows.Count -gt 0
+        $markGroup.Enabled=$enabled;$unmarkGroup.Enabled=$enabled;$eventArgs.Cancel=(-not $enabled)
+    }.GetNewClosure())
+    $grid.ContextMenuStrip=$groupMenu
+    $grid.Add_CellMouseDown({
+        param($sender,$eventArgs)
+        if($eventArgs.Button -eq [Windows.Forms.MouseButtons]::Right -and $eventArgs.RowIndex -ge 0 -and -not $ui.Grid.Rows[$eventArgs.RowIndex].Selected){
+            $ui.Grid.ClearSelection();$ui.Grid.CurrentCell=$ui.Grid.Rows[$eventArgs.RowIndex].Cells[1]
+            $ui.Grid.Rows[$eventArgs.RowIndex].Selected=$true
+        }
     }.GetNewClosure())
     $sign.Add_Click({
         try {
@@ -989,6 +1032,7 @@ function Show-ActSignerWindow {
     }
     finally {
         $form.Dispose()
+        $groupMenu.Dispose()
         $toolTip.Dispose()
         $titleFont.Dispose()
         $baseFont.Dispose()
