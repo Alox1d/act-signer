@@ -72,13 +72,26 @@ namespace ActSignerTests {
 
     # Exercise the real pipe writer against a script-host double without CAdESCOM.
     # A zero-byte source is a length line only; signatures must stay nonempty.
+    # Trace only this synthetic double. The production transport deliberately
+    # discards provider stderr and must not acquire a diagnostic logging path.
     $wireWorker = Join-Path ([IO.Path]::GetTempPath()) ('cspsigner-empty-wire-' + [Guid]::NewGuid().ToString('N') + '.js')
     $wireProgram = @'
-function line(value) { WScript.StdOut.WriteLine(value); }
-function read(expected) { if (WScript.StdIn.ReadLine() !== expected) WScript.Quit(1); }
+var tracePath = String(WScript.Arguments.Item(0));
+var files = new ActiveXObject("Scripting.FileSystemObject"), reads = 0, writes = 0;
+function trace(value) { var file = files.OpenTextFile(tracePath, 8, true, 0); file.WriteLine(value); file.Close(); }
+function line(value) { trace("WRITE." + (++writes) + ".WAIT"); WScript.StdOut.WriteLine(value); trace("WRITE." + writes + ".DONE"); }
+function value() {
+    trace("READ." + (++reads) + ".WAIT");
+    var result = WScript.StdIn.ReadLine(), codes = [];
+    for (var i = 0; i < Math.min(8, result.length); i++) codes.push(result.charCodeAt(i));
+    trace("READ." + reads + ".DONE.LEN=" + result.length + ".CODES=" + codes.join(","));
+    return result;
+}
+function read(expected) { if (value() !== expected) { trace("MISMATCH"); WScript.Quit(1); } }
+trace("START");
 while (true) {
     read("ACTSIGNER/1");
-    var id = WScript.StdIn.ReadLine(), command = WScript.StdIn.ReadLine();
+    var id = value(), command = value();
     if (command === "SIGN") { read("100"); read("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
     if (command === "VERIFY" || command === "VERIFYEMPTY") read("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     if (command === "VERIFYEMPTY") read("102");
@@ -90,19 +103,89 @@ while (true) {
     if (command === "VERIFY" || command === "VERIFYEMPTY") { line("1"); line("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
     if (command === "INSPECT") { line("valid"); line("1"); line("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
     line("END");
-    if (command === "CLOSE") WScript.Quit(0);
+    if (command === "CLOSE") { trace("QUIT.0"); WScript.Quit(0); }
 }
 '@
+    function Read-SyntheticWireTrace {
+        param([string]$Path)
+        if (-not [IO.File]::Exists($Path)) { return 'NO_TRACE' }
+        $text=[IO.File]::ReadAllText($Path)
+        if($text.Length -gt 4096){$text=$text.Substring($text.Length-4096)}
+        return ($text -replace '\r?\n','|')
+    }
+    function Get-SyntheticWireProbe {
+        param([string]$Worker,[string]$Command,[int]$Kind,[string]$TracePath)
+        # An independent bounded probe feeds the same synthetic request plus
+        # CLOSE before awaiting output, exposing host stderr/exit and buffering.
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=Get-ActCScriptPath
+        $workerArguments=@('//NoLogo','//U','//E:JScript',$Worker,$TracePath)
+        $info.Arguments=(@($workerArguments | ForEach-Object {[ActSigner.CScriptTransport]::QuoteArgument($_)}) -join ' ')
+        $info.UseShellExecute=$false;$info.CreateNoWindow=$true
+        $info.RedirectStandardInput=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+        $encoding=[Text.UnicodeEncoding]::new($false,$false,$true)
+        $info.StandardOutputEncoding=$encoding;$info.StandardErrorEncoding=$encoding
+        $process=New-Object Diagnostics.Process;$process.StartInfo=$info
+        $clock=[Diagnostics.Stopwatch]::StartNew()
+        $output=$null;$errorOutput=$null
+        $result=[ordered]@{Command=$Command;Started=$false;TimedOut=$false;ExitCode=$null;ElapsedMs=0;StdoutChars=0;ExpectedMagic=$false;Stderr='';Trace='';FailureType=''}
+        try {
+            $result.Started=$process.Start()
+            $output=$process.StandardOutput.ReadToEndAsync();$errorOutput=$process.StandardError.ReadToEndAsync()
+            $probeWriter=[IO.StreamWriter]::new($process.StandardInput.BaseStream,$encoding,1024)
+            $probeWriter.NewLine="`r`n"
+            $lines=@('ACTSIGNER/1',('0'*32),$Command)
+            if($Command -ceq 'SIGN'){$lines+=@('100',('A'*40))}
+            if($Command -in @('VERIFY','VERIFYEMPTY')){$lines+=('A'*40)}
+            if($Command -ceq 'VERIFYEMPTY'){$lines+=([string]$Kind)}
+            $lines+='0'
+            if($Command -in @('VERIFY','VERIFYEMPTY','INSPECT')){$lines+=@('3','YWJj')}
+            $lines+=@('END','ACTSIGNER/1',('1'*32),'CLOSE','END')
+            foreach($item in $lines){$probeWriter.WriteLine($item)}
+            $probeWriter.Flush();$probeWriter.Dispose()
+            if(-not $process.WaitForExit(5000)){$result.TimedOut=$true;$process.Kill();[void]$process.WaitForExit(2000)}
+            if($process.HasExited){$result.ExitCode=$process.ExitCode}
+        } catch {$result.FailureType=$_.Exception.GetType().FullName}
+        finally {
+            try{if(-not $process.HasExited){$process.Kill();[void]$process.WaitForExit(2000)}}catch{}
+            try {
+                if($null -ne $output -and $output.Wait(1000)){$result.StdoutChars=$output.Result.Length;$result.ExpectedMagic=$output.Result.StartsWith('ACTSIGNER/1')}
+                if($null -ne $errorOutput -and $errorOutput.Wait(1000)){
+                    $stderr=$errorOutput.Result.Replace($Worker,'<SYNTHETIC_WORKER>').Replace([IO.Path]::GetDirectoryName($Worker),'<SYNTHETIC_TEMP>')
+                    if($stderr.Length -gt 1024){$stderr=$stderr.Substring(0,1024)}
+                    $result.Stderr=$stderr
+                }
+            } catch {}
+            $clock.Stop();$result.ElapsedMs=$clock.ElapsedMilliseconds
+            $result.Trace=Read-SyntheticWireTrace $TracePath
+            $process.Dispose()
+        }
+        return [pscustomobject]$result
+    }
     try {
         [IO.File]::WriteAllText($wireWorker, ($wireProgram -replace '\r?\n', "`r`n"), [Text.Encoding]::ASCII)
         foreach ($command in @('SIGN', 'VERIFY', 'VERIFYEMPTY', 'INSPECT')) {
-            $wire = [ActSigner.CScriptTransport]::new((Get-ActCScriptPath), [string[]]@('//NoLogo','//U','//E:JScript',$wireWorker))
+            $tracePath=$wireWorker+'.'+$command+'.trace'
+            $probeTracePath=$tracePath+'.probe'
+            $wire=$null
+            $clock=[Diagnostics.Stopwatch]::StartNew()
+            $kind=if($command -ceq 'VERIFYEMPTY'){102}else{100}
             try {
-                $kind=if($command -ceq 'VERIFYEMPTY'){102}else{100}
+                $wire = [ActSigner.CScriptTransport]::new((Get-ActCScriptPath), [string[]]@('//NoLogo','//U','//E:JScript',$wireWorker,$tracePath))
                 $reply = $wire.Exchange($command, $kind, ('A' * 40), [byte[]]@(), [byte[]]@(97,98,99), 3000, 4096)
                 Assert-Case ($reply[2] -ceq 'OK' -and $reply[3] -ceq $command) 'Pipe framing must preserve a zero-byte source without an extra Base64 line.'
                 $wire.Finish(3000)
-            } finally { $wire.Dispose() }
+                Write-Host ('PASS: synthetic CScript pipe {0}; elapsed={1} ms.' -f $command,$clock.ElapsedMilliseconds)
+            } catch {
+                $clock.Stop()
+                Write-Host ('DIAGNOSTIC: synthetic CScript {0}; elapsed={1} ms; trace={2}' -f $command,$clock.ElapsedMilliseconds,(Read-SyntheticWireTrace $tracePath))
+                $probe=Get-SyntheticWireProbe $wireWorker $command $kind $probeTracePath
+                Write-Host ('DIAGNOSTIC: synthetic CScript independent probe '+($probe | ConvertTo-Json -Compress))
+                throw
+            } finally {
+                if($null -ne $wire){$wire.Dispose()}
+                foreach($path in @($tracePath,$probeTracePath)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force}}
+            }
         }
     } finally { Remove-Item -LiteralPath $wireWorker -Force }
 
