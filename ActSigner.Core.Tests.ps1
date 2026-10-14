@@ -64,9 +64,9 @@ try {
     $oneOutput = Join-Path $testRoot 'Сохранённые копии'
     $oneSource = Join-Path $oneRoot 'Май/Акт_оказанных_услуг.pdf'
     Write-Fixture $oneSource '%PDF-1.4 immutable-original'
-    Write-Fixture (Join-Path $oneRoot 'Май/signature.sig') 'WB-signature-bytes'
-    Write-Fixture (Join-Path $oneRoot 'Май/signature(1).sig') 'WB-second-signature-bytes'
-    Write-Fixture (Join-Path $oneRoot 'Май/Акт_оказанных_услуг.pdf.sig') 'WB-filename-signature'
+    Write-Fixture (Join-Path $oneRoot 'Май/signature.sig') 'other-signature-bytes'
+    Write-Fixture (Join-Path $oneRoot 'Май/signature(1).sig') 'second-other-signature-bytes'
+    Write-Fixture (Join-Path $oneRoot 'Май/Акт_оказанных_услуг.pdf.sig') 'filename-signature-bytes'
     Write-Fixture (Join-Path $oneRoot 'Май/Печатная_форма_001.pdf') '%PDF-1.4 print-copy'
     Write-Fixture (Join-Path $oneRoot 'Май/signature-old.my.sig') 'must-not-copy'
     $unrelatedInspector = { param([byte[]]$PdfBytes, [byte[]]$SignatureBytes) [pscustomobject]@{ Status = 'different_content'; Thumbprints = @(); Message = 'Synthetic unrelated companion.' } }

@@ -16,6 +16,7 @@ $payload = @(
     'ActSigner.Console.psm1', 'ActSigner.Core.psm1', 'ActSigner.CryptoPro.js',
     'ActSigner.CryptoPro.psm1', 'ActSigner.Settings.psm1', 'ActSigner.UI.psm1',
     'ActSigner.Update.psm1', 'ActSigner.Version.json', 'README.md', 'README.txt',
+    'README.en.md', 'REFERENCE.md',
     'Sign-Acts.ps1', 'Start-ActSigner.ps1', 'Start.cmd', 'Update-ActSigner.ps1',
     'diagnostics/Check-CryptoPro.cmd', 'diagnostics/Check-CryptoPro.js',
     'diagnostics/Check-CryptoPro.ps1', 'diagnostics/README.txt'
@@ -48,9 +49,13 @@ if ($version.Version -isnot [string] -or $version.Version -cnotmatch '^(0|[1-9][
 foreach ($component in $version.Version.Split('.')) { $number = 0; if (-not [int]::TryParse($component, [ref]$number)) { throw 'Version components must fit Int32.' } }
 $assetName = 'ActSigner-' + $version.Version + '.zip'
 $zipPath = Join-Path $OutputDirectory $assetName
+# Keep the update asset name for installed ActSigner clients. Both ZIPs have identical bytes.
+$publicAssetName = 'CSPSigner-' + $version.Version + '.zip'
+$publicZipPath = Join-Path $OutputDirectory $publicAssetName
 $manifestPath = Join-Path $OutputDirectory 'ActSigner-update.json'
 if (Test-Path -LiteralPath $zipPath) { throw 'ZIP already exists; release assets are immutable.' }
 if (Test-Path -LiteralPath $manifestPath) { throw 'Manifest already exists; release assets are immutable.' }
+if (Test-Path -LiteralPath $publicZipPath) { throw 'Public ZIP already exists; release assets are immutable.' }
 $files = New-Object 'System.Collections.Generic.List[object]'
 $total = [long]0
 foreach ($relative in $payload) {
@@ -69,6 +74,8 @@ $staging = Join-Path $OutputDirectory ('.build-' + [guid]::NewGuid().ToString('N
 $zipTemporary = Join-Path $staging $assetName
 $manifestTemporary = Join-Path $staging 'ActSigner-update.json'
 $zipCommitted = $false
+$publicZipCommitted = $false
+$publicZipTemporary = Join-Path $staging $publicAssetName
 try {
     $archive = [IO.Compression.ZipFile]::Open($zipTemporary, [IO.Compression.ZipArchiveMode]::Create)
     try {
@@ -96,10 +103,13 @@ try {
     }
     [IO.File]::WriteAllText($manifestTemporary, (($manifest | ConvertTo-Json -Depth 6) + "`n"), (New-Object Text.UTF8Encoding($false)))
     if ((Get-Item -LiteralPath $manifestTemporary).Length -gt 256KB) { throw 'Manifest exceeds the updater 256 KiB limit.' }
+    [IO.File]::Copy($zipTemporary, $publicZipTemporary, $false)
     [IO.File]::Move($zipTemporary, $zipPath); $zipCommitted = $true
+    [IO.File]::Move($publicZipTemporary, $publicZipPath); $publicZipCommitted = $true
     [IO.File]::Move($manifestTemporary, $manifestPath)
-    [pscustomobject]@{ Version = $version.Version; ZipPath = $zipPath; ManifestPath = $manifestPath; Sha256 = $manifest.Sha256 }
+    [pscustomobject]@{ Version = $version.Version; ZipPath = $zipPath; PublicZipPath = $publicZipPath; ManifestPath = $manifestPath; Sha256 = $manifest.Sha256 }
 } catch {
     if ($zipCommitted -and [IO.File]::Exists($zipPath)) { [IO.File]::Delete($zipPath) }
+    if ($publicZipCommitted -and [IO.File]::Exists($publicZipPath)) { [IO.File]::Delete($publicZipPath) }
     throw
 } finally { if ([IO.Directory]::Exists($staging)) { Remove-Item -LiteralPath $staging -Recurse -Force } }

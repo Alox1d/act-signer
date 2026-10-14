@@ -14,6 +14,44 @@ namespace ActSignerTests {
  public sealed class CmsFixture {
   public byte[] Pdf, Signature;
   public string[] Thumbprints;
+  private static byte[] Der(byte tag, params byte[][] values) {
+   var content=new List<byte>();foreach(var value in values)content.AddRange(value);
+   var encoded=new List<byte>();encoded.Add(tag);
+   if(content.Count<128)encoded.Add((byte)content.Count);
+   else { var size=new List<byte>();int length=content.Count;while(length>0){size.Insert(0,(byte)(length&255));length>>=8;}encoded.Add((byte)(128+size.Count));encoded.AddRange(size); }
+   encoded.AddRange(content);return encoded.ToArray();
+  }
+  public static CmsFixture MakeEmpty(bool expired) {
+   return MakeEmpty(expired,false,false);
+  }
+  private static byte[] Ber(byte tag, params byte[][] values) {
+   var encoded=new List<byte>();encoded.Add(tag);encoded.Add(0x80);
+   foreach(var value in values)encoded.AddRange(value);
+   encoded.Add(0);encoded.Add(0);return encoded.ToArray();
+  }
+  public static CmsFixture MakeEmpty(bool expired, bool attached, bool ber) {
+   // .NET SignedCms refuses to create empty-content signatures. Build a
+   // detached CMS envelope around a real synthetic RSA signature instead.
+   using(var key=new RSACryptoServiceProvider(2048)) {
+    key.PersistKeyInCsp=false;
+    var request=new CertificateRequest("CN=Synthetic empty file signer",key,HashAlgorithmName.SHA256,RSASignaturePadding.Pkcs1);
+    using(var cert=request.CreateSelfSigned(DateTimeOffset.Now.AddYears(-3),expired?DateTimeOffset.Now.AddYears(-2):DateTimeOffset.Now.AddDays(1))) {
+     byte[] serial=cert.GetSerialNumber();Array.Reverse(serial);
+     if((serial[0]&128)!=0)serial=DerSerial(serial);
+     byte[] sha256=Der(0x30,Der(0x06,new byte[]{0x60,0x86,0x48,1,0x65,3,4,2,1}),Der(0x05));
+     byte[] rsa=Der(0x30,Der(0x06,new byte[]{0x2a,0x86,0x48,0x86,0xf7,0x0d,1,1,1}),Der(0x05));
+     byte[] signer=Der(0x30,Der(0x02,new byte[]{1}),Der(0x30,cert.IssuerName.RawData,Der(0x02,serial)),sha256,rsa,Der(0x04,key.SignData(new byte[0],HashAlgorithmName.SHA256,RSASignaturePadding.Pkcs1)));
+     byte[] contentOid=Der(0x06,new byte[]{0x2a,0x86,0x48,0x86,0xf7,0x0d,1,7,1});
+     byte[] content=attached?(ber?Ber(0x30,contentOid,Ber(0xa0,Der(0x04))):Der(0x30,contentOid,Der(0xa0,Der(0x04)))):(ber?Ber(0x30,contentOid):Der(0x30,contentOid));
+     byte[][] fields={Der(0x02,new byte[]{1}),Der(0x31,sha256),content,Der(0xa0,cert.RawData),Der(0x31,signer)};
+     byte[] signed=ber?Ber(0x30,fields):Der(0x30,fields);
+     byte[] signedOid=Der(0x06,new byte[]{0x2a,0x86,0x48,0x86,0xf7,0x0d,1,7,2});
+     byte[] signature=ber?Ber(0x30,signedOid,Ber(0xa0,signed)):Der(0x30,signedOid,Der(0xa0,signed));
+     return new CmsFixture{Pdf=new byte[0],Signature=signature,Thumbprints=new[]{cert.Thumbprint}};
+    }
+   }
+  }
+  private static byte[] DerSerial(byte[] serial) {var positive=new byte[serial.Length+1];Array.Copy(serial,0,positive,1,serial.Length);return positive;}
   public static byte[] Certificate(string subject) {
    using(var key=new RSACryptoServiceProvider(2048)) {
     key.PersistKeyInCsp=false;
@@ -69,6 +107,82 @@ foreach($expired in @($false,$true)) {
     Assert-Cms ($bad.Status -ceq 'identified' -and $bad.Signers[0].SignatureStatus -ceq 'unverifiable') 'Changed PDF must not count as a confirmed signature or proven unrelated content.'
 }
 Write-Host 'PASS: native exact-byte verification independent of expired/untrusted certificate chains; changed PDF rejected.'
+
+# Reinstating a nonempty-content guard must reject these real empty-file signatures.
+foreach($expired in @($false,$true)) {
+    $fixture=[ActSignerTests.CmsFixture]::MakeEmpty($expired)
+    $native=[ActSigner.NativeCmsInspector]::Inspect($fixture.Pdf,$fixture.Signature)
+    Assert-Cms ($native.Count -eq 1 -and $native[0].SignatureStatus -ceq 'valid' -and $native[0].Thumbprint -ceq $fixture.Thumbprints[0]) 'Native verification must authenticate the exact zero-byte source.'
+    $oid=$native[0].PSObject.Properties['PublicKeyOid']
+    Assert-Cms ($null -ne $oid -and $oid.Value -ceq '1.2.840.113549.1.1.1') 'Verified signer metadata must expose its public-key algorithm, not the certificate issuer-signature algorithm.'
+    $invalidNative=[ActSigner.NativeCmsInspector]::Inspect([byte[]]@(0),$fixture.Signature)
+    Assert-Cms ([string]::IsNullOrEmpty($invalidNative[0].PublicKeyOid)) 'An unverified signer must not supply the hash-algorithm choice for full verification.'
+    $info=Get-ActExistingSignatureInfo $fixture.Pdf $fixture.Signature
+    Assert-Cms ($info.Status -ceq 'identified' -and $info.Signers.Count -eq 1 -and $info.Signers[0].SignatureStatus -ceq 'valid' -and $info.TrustStatus -ceq 'not_checked') 'An empty source must retain separate signature mathematics and certificate trust.'
+    $changed=Get-ActExistingSignatureInfo ([byte[]]@(0)) $fixture.Signature
+    Assert-Cms ($changed.Status -ceq 'identified' -and $changed.Signers[0].SignatureStatus -ceq 'unverifiable') 'Adding one byte to an empty source must invalidate its signature.'
+    $missing=Get-ActExistingSignatureInfo $fixture.Pdf ([byte[]]@())
+    Assert-Cms ($missing.Status -ceq 'unverifiable' -and $missing.Signers.Count -eq 0) 'An empty signature must remain unverifiable for an empty source.'
+}
+Write-Host 'PASS: empty-file detached CMS signatures, exact content binding and unchanged trust separation.'
+
+# A mathematically valid RSA fixture is deliberately unsupported by the GOST-only
+# full empty-file verifier. It must fail before starting any CAdES worker.
+$fixture=[ActSignerTests.CmsFixture]::MakeEmpty($false)
+$module=Get-Module ActSigner.CryptoPro
+& $module {
+    param($fixture)
+    $saved=(Get-Item Function:Invoke-ActBridgeOnce).ScriptBlock
+    $script:EmptyUnsupportedWorkerCalls=0
+    try {
+        Set-Item Function:script:Invoke-ActBridgeOnce -Value {
+            param($Command,$Kind,$Thumbprint)
+            $script:EmptyUnsupportedWorkerCalls++
+            return ,([string[]]@('1',$Thumbprint))
+        }
+        $failed=$false
+        try { Test-ActCryptoSignature $fixture.Pdf $fixture.Signature $fixture.Thumbprints[0] } catch { $failed=$true }
+        if(-not $failed -or $script:EmptyUnsupportedWorkerCalls -ne 0) { throw 'ASSERT: Unsupported embedded public-key algorithms must fail before a full-verification worker.' }
+    } finally {
+        Set-Item Function:script:Invoke-ActBridgeOnce -Value $saved
+        Remove-Variable EmptyUnsupportedWorkerCalls -Scope Script
+    }
+} $fixture
+Write-Host 'PASS: unsupported empty-file embedded public-key algorithm rejected before the worker.'
+
+# Explicit empty eContent is attached CMS even though decoded content length is
+# zero. Restoring a length-only detached check must fail for both BER and DER.
+foreach($ber in @($false,$true)) {
+    $detached=[ActSignerTests.CmsFixture]::MakeEmpty($false,$false,$ber)
+    $detachedInfo=Get-ActExistingSignatureInfo $detached.Pdf $detached.Signature
+    Assert-Cms ($detachedInfo.Status -ceq 'identified' -and $detachedInfo.Signers.Count -eq 1 -and $detachedInfo.Signers[0].SignatureStatus -ceq 'valid') 'Detached empty CMS must remain valid with DER or BER indefinite containers.'
+    $attached=[ActSignerTests.CmsFixture]::MakeEmpty($false,$true,$ber)
+    $info=Get-ActExistingSignatureInfo $attached.Pdf $attached.Signature
+    Assert-Cms ($info.Status -ceq 'unverifiable' -and $info.Signers.Count -eq 0) 'Explicit empty eContent must remain attached, exposing no signer or public-key metadata.'
+    & $module {
+        param($fixture)
+        $savedWorker=(Get-Item Function:Invoke-ActBridgeOnce).ScriptBlock
+        $savedAlgorithm=(Get-Item Function:Get-ActEmptySignatureHashAlgorithm).ScriptBlock
+        $script:AttachedWorkerCalls=0;$script:AttachedAlgorithmCalls=0
+        try {
+            # The synthetic RSA algorithm is not the reason this test passes:
+            # the format gate must reject before even asking for an algorithm.
+            Set-Item Function:script:Get-ActEmptySignatureHashAlgorithm -Value { $script:AttachedAlgorithmCalls++; return 101 }
+            Set-Item Function:script:Invoke-ActBridgeOnce -Value {
+                param($Command,$Kind,$Thumbprint)
+                $script:AttachedWorkerCalls++;return ,([string[]]@('1',$Thumbprint))
+            }
+            $failed=$false
+            try { Test-ActCryptoSignature $fixture.Pdf $fixture.Signature $fixture.Thumbprints[0] } catch { $failed=$true }
+            if(-not $failed -or $script:AttachedWorkerCalls -ne 0 -or $script:AttachedAlgorithmCalls -ne 0) { throw 'ASSERT: Attached empty CMS must fail before algorithm selection or a full-verification worker.' }
+        } finally {
+            Set-Item Function:script:Invoke-ActBridgeOnce -Value $savedWorker
+            Set-Item Function:script:Get-ActEmptySignatureHashAlgorithm -Value $savedAlgorithm
+            Remove-Variable AttachedWorkerCalls,AttachedAlgorithmCalls -Scope Script
+        }
+    } $attached
+}
+Write-Host 'PASS: attached empty eContent rejected before identity, hash selection or full verification; detached BER retained.'
 
 $fixture=[ActSignerTests.CmsFixture]::Make(2,$true,$false,$true,$false,$false)
 $info=Get-ActExistingSignatureInfo $fixture.Pdf $fixture.Signature

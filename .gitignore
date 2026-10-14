@@ -23,6 +23,7 @@
 settings.json
 ActSigner-diagnostics*.txt
 _ActSigner_logs/
+_CSPSigner_logs/
 *.[lL][oO][gG]
 *.[cC][sS][vV]
 *.[tT][mM][pP]
