@@ -406,7 +406,7 @@ try {
     $reportEncoding = New-Object Text.UTF8Encoding -ArgumentList $true
     $script:ReportWriter = New-Object IO.StreamWriter -ArgumentList @($reportPath, $false, $reportEncoding)
     $script:ReportWriter.AutoFlush = $true
-    Write-ReportLine 'ActSigner diagnostics 1.0'
+    Write-ReportLine 'CSPSigner diagnostics 1.0'
     Write-ReportLine ('UTC={0}' -f [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
     Write-ReportLine 'Проверка КриптоПро: только открытие хранилищ, число сертификатов и закрытие.'
     Write-ReportLine 'Сертификаты, подписи, ключи и настройки системы не изменяются.'

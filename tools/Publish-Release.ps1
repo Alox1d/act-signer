@@ -49,7 +49,7 @@ function Assert-MatchingDraft {
     param($Release)
     if ($null -eq $Release -or $Release.draft -ne $true -or $Release.prerelease -ne $false -or $Release.tag_name -cne $tag -or $Release.target_commitish -cne $SourceCommit) { throw 'Refusing a published release, prerelease or draft for another source commit. Bump the version for new source.' }
     foreach ($asset in @($Release.assets)) {
-        if ($asset.name -cne $manifest.AssetName -and $asset.name -cne 'ActSigner-update.json') { throw 'Existing draft contains an unexpected asset; refusing to modify it.' }
+        if ($asset.name -cne $manifest.AssetName -and $asset.name -cne $publicAssetName -and $asset.name -cne 'ActSigner-update.json') { throw 'Existing draft contains an unexpected asset; refusing to modify it.' }
     }
 }
 $AssetDirectory = [IO.Path]::GetFullPath($AssetDirectory)
@@ -60,7 +60,10 @@ foreach ($part in $manifest.Version.Split('.')) { $number = 0; if (-not [int]::T
 $tag = 'v' + $manifest.Version
 if ($manifest.AssetName -cne ('ActSigner-' + $manifest.Version + '.zip')) { throw 'ZIP asset name does not match release version.' }
 $zipPath = Join-Path $AssetDirectory $manifest.AssetName
+$publicAssetName = 'CSPSigner-' + $manifest.Version + '.zip'
+$publicZipPath = Join-Path $AssetDirectory $publicAssetName
 if ($manifest.Size -ne (Get-Item -LiteralPath $zipPath).Length -or $manifest.Sha256 -cne (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Publication ZIP does not match its manifest.' }
+if ($manifest.Size -ne (Get-Item -LiteralPath $publicZipPath).Length -or $manifest.Sha256 -cne (Get-FileHash -LiteralPath $publicZipPath -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Public CSPSigner ZIP does not match the verified update ZIP.' }
 $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $release = Get-ReleaseObject
 if ($null -ne $release) { Assert-MatchingDraft $release }
@@ -76,26 +79,26 @@ if ($null -ne $tagJson) {
     if ($object.type -cne 'commit' -or $object.sha -cne $SourceCommit) { throw 'Existing version tag points to another commit; bump the release version.' }
 }
 if ($null -eq $release) {
-    Invoke-ReleaseGh -Arguments @('release', 'create', $tag, '--repo', $repository, '--target', $SourceCommit, '--title', ('ActSigner ' + $manifest.Version), '--notes', ('ActSigner ' + $manifest.Version + '. Verified native Windows PowerShell 5.1 update package.'), '--draft') | Out-Null
+    Invoke-ReleaseGh -Arguments @('release', 'create', $tag, '--repo', $repository, '--target', $SourceCommit, '--title', ('CSPSigner ' + $manifest.Version), '--notes', ('CSPSigner ' + $manifest.Version + '. File signing through CryptoPro CSP. Verified native Windows PowerShell 5.1 package.'), '--draft') | Out-Null
     $release = Get-ReleaseObject
     Assert-MatchingDraft $release
 }
-# Recovery is limited to an unpublished same-commit draft and these two asset names.
+# Recovery is limited to an unpublished same-commit draft and these three asset names.
 # A failure at any point before edit leaves the release unpublished for a safe retry.
-Invoke-ReleaseGh -Arguments @('release', 'upload', $tag, $zipPath, $manifestPath, '--repo', $repository, '--clobber') | Out-Null
+Invoke-ReleaseGh -Arguments @('release', 'upload', $tag, $zipPath, $manifestPath, $publicZipPath, '--repo', $repository, '--clobber') | Out-Null
 $release = Get-ReleaseObject
 Assert-MatchingDraft $release
 $assets = @($release.assets)
-if ($assets.Count -ne 2) { throw 'Draft does not contain exactly the full two-asset pair.' }
+if ($assets.Count -ne 3) { throw 'Draft does not contain exactly the three required assets.' }
 foreach ($asset in $assets) {
-    $expectedSize = if ($asset.name -ceq $manifest.AssetName) { $manifest.Size } else { (Get-Item -LiteralPath $manifestPath).Length }
+    $expectedSize = if ($asset.name -ceq $manifest.AssetName -or $asset.name -ceq $publicAssetName) { $manifest.Size } else { (Get-Item -LiteralPath $manifestPath).Length }
     if ($asset.state -cne 'uploaded' -or $asset.size -ne $expectedSize) { throw 'Draft asset upload is incomplete or has incorrect size.' }
 }
-$readback = Join-Path ([IO.Path]::GetTempPath()) ('ActSigner-release-readback-' + [guid]::NewGuid().ToString('N'))
+$readback = Join-Path ([IO.Path]::GetTempPath()) ('CSPSigner-release-readback-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($readback)
 try {
-    Invoke-ReleaseGh -Arguments @('release', 'download', $tag, '--repo', $repository, '--pattern', $manifest.AssetName, '--pattern', 'ActSigner-update.json', '--dir', $readback) | Out-Null
-    if ((Get-FileHash -LiteralPath (Join-Path $readback $manifest.AssetName) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.Sha256 -or (Get-FileHash -LiteralPath (Join-Path $readback 'ActSigner-update.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifestHash) { throw 'Uploaded draft asset readback does not match local verified assets.' }
+    Invoke-ReleaseGh -Arguments @('release', 'download', $tag, '--repo', $repository, '--pattern', $manifest.AssetName, '--pattern', 'ActSigner-update.json', '--pattern', $publicAssetName, '--dir', $readback) | Out-Null
+    if ((Get-FileHash -LiteralPath (Join-Path $readback $publicAssetName) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.Sha256 -or (Get-FileHash -LiteralPath (Join-Path $readback $manifest.AssetName) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.Sha256 -or (Get-FileHash -LiteralPath (Join-Path $readback 'ActSigner-update.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifestHash) { throw 'Uploaded draft asset readback does not match local verified assets.' }
     $release = Get-ReleaseObject
     Assert-MatchingDraft $release
     Invoke-ReleaseGh -Arguments @('release', 'edit', $tag, '--repo', $repository, '--draft=false', '--prerelease=false', '--latest') | Out-Null

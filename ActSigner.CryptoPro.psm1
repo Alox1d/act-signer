@@ -5,7 +5,7 @@ $script:ActBridgeMaxBytes = 64MB
 $script:ActBridgeScript = Join-Path $PSScriptRoot 'ActSigner.CryptoPro.js'
 
 # Native CScript owns all CAdESCOM objects. PowerShell exchanges only public
-# certificate data, PDF snapshots and signatures through inherited local pipes.
+# certificate data, file snapshots and signatures through inherited local pipes.
 function Initialize-ActBridgeTransport {
     if ('ActSigner.CScriptTransport' -as [type]) { return }
     Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
@@ -20,6 +20,7 @@ namespace ActSigner {
     public sealed class CScriptTransport : IDisposable {
         private const int ChunkBytes = 36864;
         private const int ChunkChars = 49152;
+        private static readonly object inputEncodingSync = new object();
         private readonly object sync = new object();
         private Process process;
         private StreamWriter input;
@@ -65,7 +66,7 @@ namespace ActSigner {
             process = new Process();
             process.StartInfo = info;
             try {
-                if (!process.Start()) throw new IOException("The script host did not start.");
+                if (!StartWithoutInputPreamble(process)) throw new IOException("The script host did not start.");
                 // //U applies to redirected input as well as output. The protocol
                 // alphabet is ASCII; its wire encoding is UTF-16LE, without a BOM.
                 input = new StreamWriter(process.StandardInput.BaseStream, wire, 8192);
@@ -78,6 +79,36 @@ namespace ActSigner {
             }
         }
 
+        private static bool StartWithoutInputPreamble(Process target) {
+            // .NET Framework creates an AutoFlush stdin writer during Start.
+            // A BOM-bearing Console.InputEncoding writes a preamble before our
+            // UTF-16LE writer takes over the pipe. Keep that prefix out of the
+            // wire without changing the caller's encoding or buffered reader.
+            lock (inputEncodingSync) {
+                Encoding originalEncoding = Console.InputEncoding;
+                if (originalEncoding.GetPreamble().Length == 0) return target.Start();
+                Encoding startupEncoding;
+                switch (originalEncoding.CodePage) {
+                    case 65001: startupEncoding = new UTF8Encoding(false); break;
+                    case 1200: startupEncoding = new UnicodeEncoding(false, false); break;
+                    case 1201: startupEncoding = new UnicodeEncoding(true, false); break;
+                    case 12000: startupEncoding = new UTF32Encoding(false, false); break;
+                    case 12001: startupEncoding = new UTF32Encoding(true, false); break;
+                    default: throw new IOException("Unsupported console input preamble.");
+                }
+                TextReader originalInput = Console.In;
+                try {
+                    // Keep the code page: UnicodeLE Console.InputEncoding setters
+                    // skip SetConsoleCP, so changing to UTF-8 would leak native CP.
+                    Console.InputEncoding = startupEncoding;
+                    return target.Start();
+                } finally {
+                    try { Console.InputEncoding = originalEncoding; }
+                    finally { Console.SetIn(originalInput); }
+                }
+            }
+        }
+
         private static async Task DrainAsync(StreamReader reader) {
             // Drain continuously, retain no host/provider stderr or personal paths.
             try {
@@ -86,8 +117,8 @@ namespace ActSigner {
             } catch { }
         }
 
-        private async Task WriteBlobAsync(byte[] bytes) {
-            if (bytes == null || bytes.Length == 0 || bytes.Length > 67108864)
+        private async Task WriteBlobAsync(byte[] bytes, bool allowEmpty) {
+            if (bytes == null || (!allowEmpty && bytes.Length == 0) || bytes.Length > 67108864)
                 throw new InvalidDataException("Invalid binary length.");
             await input.WriteLineAsync(bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
             for (int offset = 0; offset < bytes.Length; offset += ChunkBytes) {
@@ -97,6 +128,8 @@ namespace ActSigner {
         }
 
         private async Task WriteRequestAsync(string id, string command, int kind, string thumbprint, byte[] pdf, byte[] signature) {
+            if (command == "VERIFYEMPTY" && ((kind != 101 && kind != 102) || pdf == null || pdf.Length != 0))
+                throw new InvalidDataException("Invalid empty-file verification request.");
             await input.WriteLineAsync("ACTSIGNER/1").ConfigureAwait(false);
             await input.WriteLineAsync(id).ConfigureAwait(false);
             await input.WriteLineAsync(command).ConfigureAwait(false);
@@ -104,9 +137,10 @@ namespace ActSigner {
                 await input.WriteLineAsync(kind.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
                 await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
             }
-            if (command == "VERIFY") await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
-            if (command == "SIGN" || command == "VERIFY" || command == "INSPECT") await WriteBlobAsync(pdf).ConfigureAwait(false);
-            if (command == "VERIFY" || command == "INSPECT") await WriteBlobAsync(signature).ConfigureAwait(false);
+            if (command == "VERIFY" || command == "VERIFYEMPTY") await input.WriteLineAsync(thumbprint).ConfigureAwait(false);
+            if (command == "VERIFYEMPTY") await input.WriteLineAsync(kind.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
+            if (command == "SIGN" || command == "VERIFY" || command == "VERIFYEMPTY" || command == "INSPECT") await WriteBlobAsync(pdf, true).ConfigureAwait(false);
+            if (command == "VERIFY" || command == "VERIFYEMPTY" || command == "INSPECT") await WriteBlobAsync(signature, false).ConfigureAwait(false);
             await input.WriteLineAsync("END").ConfigureAwait(false);
             await input.FlushAsync().ConfigureAwait(false);
         }
@@ -254,7 +288,7 @@ function Get-ActBridgeErrorText {
         'THUMBPRINT' { 'Отпечаток сертификата не совпал с выбранным.' }
         'SIGNER_COUNT' { 'В новой подписи должен быть ровно один подписант.' }
         'SIGNER_MISMATCH' { 'Новая подпись создана другим сертификатом.' }
-        'BINARY_LIMIT' { 'Пустые данные или превышен предел 64 МиБ.' }
+        'BINARY_LIMIT' { 'Некорректный размер данных. Предел для файла и подписи - 64 МиБ.' }
         'DISCOVERY_LIMIT' { 'Превышен допустимый объём списка сертификатов.' }
         'SESSION' { 'Сеанс подписи недействителен или уже закрыт.' }
         'PROTOCOL' { 'Получены некорректные данные локального процесса КриптоПро.' }
@@ -267,7 +301,7 @@ function Invoke-ActBridgeExchange {
     param($Transport, [string]$Command, [int]$Kind = 0, [string]$Thumbprint = '', [byte[]]$PdfBytes = $null, [byte[]]$SignatureBytes = $null, [int]$Timeout = 60000)
     $maximum = 24MB
     if ($Command -eq 'SIGN') { $maximum = 90MB }
-    if ($Command -in @('CHECK', 'VERIFY')) { $maximum = 4096 }
+    if ($Command -in @('CHECK', 'VERIFY', 'VERIFYEMPTY')) { $maximum = 4096 }
     if ($Command -eq 'INSPECT') { $maximum = 192KB }
     try {
         $reply = $Transport.Exchange($Command, $Kind, $Thumbprint, $PdfBytes, $SignatureBytes, $Timeout, $maximum)
@@ -284,7 +318,7 @@ function Invoke-ActBridgeExchange {
     if ($reply[2] -ceq 'ERROR') {
         if ($reply.Length -ne 8 -or $reply[4] -cnotmatch '^[A-Za-z0-9.]{1,64}$' -or $reply[5] -cnotmatch '^[A-Z_]{1,32}$' -or $reply[6] -cnotmatch '^0x[0-9A-F]{8}$') { throw 'Некорректный код ошибки локального процесса КриптоПро.' }
         $failure=[InvalidOperationException]::new((Get-ActBridgeErrorText $reply[4] $reply[5] $reply[6]))
-        if($Command -in @('SELECT','SIGN','VERIFY')) {
+        if($Command -in @('SELECT','SIGN','VERIFY','VERIFYEMPTY')) {
             $failure.Data['ActSignerFailure']=if($reply[6] -in @('0x80090036','0x8010006E','0x800704C7')){'cancelled'}else{'session'}
         }
         throw $failure
@@ -454,9 +488,9 @@ function New-ActCryptoSession {
 }
 
 function Invoke-ActCryptoSign {
-    param([Parameter(Mandatory = $true)][object]$Session, [Parameter(Mandatory = $true)][byte[]]$PdfBytes)
+    param([Parameter(Mandatory = $true)][object]$Session, [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$PdfBytes)
     if ($Session.Closed -or $Session.Transport.IsClosed) { throw 'Сеанс подписи уже закрыт. Начните подписание заново.' }
-    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер PDF должен быть от 1 байта до 64 МиБ.' }
+    if ($PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер файла не должен превышать 64 МиБ.' }
     try {
         $thumbprint = Get-ActNormalizedThumbprint $Session.Thumbprint
         $kind = [int]$Session.StoreKind
@@ -473,17 +507,46 @@ function Invoke-ActCryptoSign {
     }
 }
 
+function Get-ActEmptySignatureHashAlgorithm {
+    param([AllowEmptyCollection()][object[]]$Signers, [string]$Thumbprint)
+    if ($Signers.Count -ne 1 -or $Signers[0].SignatureStatus -cne 'valid' -or $Signers[0].Thumbprint -cne $Thumbprint) {
+        throw 'Математическая проверка пустого файла не подтвердила единственного выбранного подписанта.'
+    }
+    # This OID belongs to the actual mathematically verified embedded signer.
+    # The algorithm used by the certificate issuer is unrelated to this choice.
+    switch ($Signers[0].PublicKeyOid) {
+        '1.2.643.7.1.1.1.1' { return 101 }
+        '1.2.643.7.1.1.1.2' { return 102 }
+        default { throw 'Для проверки новой подписи пустого файла требуется публичный ключ ГОСТ Р 34.10-2012.' }
+    }
+}
+
 function Test-ActCryptoSignature {
     param(
-        [Parameter(Mandatory = $true)][byte[]]$PdfBytes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$PdfBytes,
         [Parameter(Mandatory = $true)][byte[]]$SignatureBytes,
         [Parameter(Mandatory = $true)][string]$Thumbprint
     )
-    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes -or $SignatureBytes.Length -le 0 -or $SignatureBytes.Length -gt $script:ActBridgeMaxBytes) {
-        throw 'Некорректный размер PDF или подписи: допустимо от 1 байта до 64 МиБ.'
+    if ($PdfBytes.Length -gt $script:ActBridgeMaxBytes -or $SignatureBytes.Length -le 0 -or $SignatureBytes.Length -gt $script:ActBridgeMaxBytes) {
+        throw 'Файл не должен превышать 64 МиБ; размер подписи должен быть от 1 байта до 64 МиБ.'
     }
     $expected = Get-ActNormalizedThumbprint $Thumbprint
-    $payload = Invoke-ActBridgeOnce 'VERIFY' 0 $expected $PdfBytes $SignatureBytes 600000
+    if ($PdfBytes.Length -eq 0) {
+        try {
+            Initialize-ActNativeCmsInspector
+            $native = @([ActSigner.NativeCmsInspector]::Inspect($PdfBytes, $SignatureBytes))
+            $algorithm = Get-ActEmptySignatureHashAlgorithm $native $expected
+        } catch {
+            $failure = [InvalidOperationException]::new('Подпись пустого файла не прошла математическую проверку выбранного подписанта или содержит неподдерживаемый публичный ключ.')
+            $failure.Data['ActSignerFailure'] = 'session'
+            throw $failure
+        }
+        # Additive command: legacy VERIFY frames and nonempty-file behavior stay
+        # compatible. No installed certificate store is needed for verification.
+        $payload = Invoke-ActBridgeOnce 'VERIFYEMPTY' $algorithm $expected $PdfBytes $SignatureBytes 600000
+    } else {
+        $payload = Invoke-ActBridgeOnce 'VERIFY' 0 $expected $PdfBytes $SignatureBytes 600000
+    }
     if ($payload.Length -ne 2 -or $payload[0] -cne '1' -or $payload[1] -cne $expected) { throw 'Проверка подписи не подтвердила единственного выбранного подписанта.' }
 }
 
@@ -528,7 +591,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 namespace ActSigner {
     public sealed class NativeCmsSigner {
-        public string Thumbprint, SignatureStatus, HResult;
+        public string Thumbprint, SignatureStatus, HResult, PublicKeyOid;
         public DateTime NotBeforeUtc, NotAfterUtc;
     }
     // Read-only CryptoAPI: no user stores, chain validation, private keys or PIN.
@@ -620,12 +683,52 @@ namespace ActSigner {
             if (length > bytes.Length - offset) throw new FormatException("CMS_TRUNCATED");
             offset += (int)length;
         }
+        // Read only the bounded CMS path needed to distinguish absent eContent
+        // from explicit empty eContent. Preserve BER indefinite containers.
+        static int ContentElement(byte[] bytes, ref int offset, int limit, int tag, out int contentEnd) {
+            int start = offset;
+            if (start >= limit || bytes[start] != tag) throw new FormatException("CMS_CONTENT_INFO");
+            int end = start, nodes = 0;
+            EnvelopeEnd(bytes, ref end, 0, ref nodes);
+            if (end > limit) throw new FormatException("CMS_CONTENT_INFO");
+            int first = bytes[start + 1], content = start + 2;
+            if (first == 128) contentEnd = end - 2;
+            else {
+                if ((first & 128) != 0) content += first & 127;
+                contentEnd = end;
+            }
+            if (content > contentEnd) throw new FormatException("CMS_CONTENT_INFO");
+            offset = end;
+            return content;
+        }
+        static void RequireDetachedContent(byte[] signature) {
+            int cursor = 0, outerEnd, ignored;
+            int outer = ContentElement(signature, ref cursor, signature.Length, 0x30, out outerEnd);
+            cursor = outer;
+            ContentElement(signature, ref cursor, outerEnd, 0x06, out ignored);
+            int wrapperEnd;
+            int wrapper = ContentElement(signature, ref cursor, outerEnd, 0xa0, out wrapperEnd);
+            if (cursor != outerEnd) throw new FormatException("CMS_CONTENT_INFO");
+            cursor = wrapper;
+            int signedEnd;
+            int signed = ContentElement(signature, ref cursor, wrapperEnd, 0x30, out signedEnd);
+            if (cursor != wrapperEnd) throw new FormatException("CMS_CONTENT_INFO");
+            cursor = signed;
+            ContentElement(signature, ref cursor, signedEnd, 0x02, out ignored);
+            ContentElement(signature, ref cursor, signedEnd, 0x31, out ignored);
+            int infoEnd;
+            int info = ContentElement(signature, ref cursor, signedEnd, 0x30, out infoEnd);
+            cursor = info;
+            ContentElement(signature, ref cursor, infoEnd, 0x06, out ignored);
+            if (cursor != infoEnd) throw new FormatException("CMS_NOT_DETACHED_DATA");
+        }
         public static NativeCmsSigner[] Inspect(byte[] pdf, byte[] signature) {
-            if (pdf == null || signature == null || pdf.Length < 1 || signature.Length < 1 || pdf.Length > MaxBytes || signature.Length > MaxBytes) throw new FormatException("CMS_SIZE");
+            if (pdf == null || signature == null || signature.Length < 1 || pdf.Length > MaxBytes || signature.Length > MaxBytes) throw new FormatException("CMS_SIZE");
             int end = 0, nodes = 0;
             if (signature[0] != 0x30) throw new FormatException("CMS_NOT_SEQUENCE");
             EnvelopeEnd(signature, ref end, 0, ref nodes);
             if (end != signature.Length) throw new FormatException("CMS_TRAILING_BYTES");
+            RequireDetachedContent(signature);
             IntPtr message = IntPtr.Zero, store = IntPtr.Zero;
             var certificates = new List<X509Certificate2>();
             try {
@@ -687,6 +790,7 @@ namespace ActSigner {
                             if (verified && actual != IntPtr.Zero) {
                                 using (var actualCertificate = new X509Certificate2(actual)) {
                                     if (Convert.ToBase64String(actualCertificate.RawData) != Convert.ToBase64String(certificate.RawData)) throw new FormatException("CMS_SIGNER_MISMATCH");
+                                    item.PublicKeyOid = actualCertificate.PublicKey.Oid.Value;
                                 }
                                 item.SignatureStatus = "valid";
                             } else item.HResult = "0x" + error.ToString("X8");
@@ -708,10 +812,10 @@ namespace ActSigner {
 
 function Get-ActExistingSignatureInfo {
     param(
-        [Parameter(Mandatory = $true)][byte[]]$PdfBytes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$PdfBytes,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$SignatureBytes
     )
-    if ($PdfBytes.Length -le 0 -or $PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер проверяемого PDF должен быть от 1 байта до 64 МиБ.' }
+    if ($PdfBytes.Length -gt $script:ActBridgeMaxBytes) { throw 'Размер проверяемого файла не должен превышать 64 МиБ.' }
     try {
         [byte[]]$signature = ConvertTo-ActExistingSignatureDer $SignatureBytes
         Initialize-ActNativeCmsInspector
@@ -731,7 +835,7 @@ function Get-ActExistingSignatureInfo {
         if ($error -is [FormatException] -and $error.Message -cmatch '^CMS_[A-Z_]+$') { $detail = $error.Message }
         $hr = '0x{0:X8}' -f ([long]$error.HResult -band 4294967295L)
         if ($error -is [ComponentModel.Win32Exception]) { $hr = '0x{0:X8}' -f ([long]$error.NativeErrorCode -band 4294967295L) }
-        return [pscustomobject]@{ Status = 'unverifiable'; Signers = @(); Thumbprints = @(); TrustStatus = 'not_checked'; Message = ('Не удалось надёжно определить всех подписантов CMS. Код {0}; HRESULT {1}. Автоматическое подписание этого акта запрещено.' -f $detail, $hr) }
+        return [pscustomobject]@{ Status = 'unverifiable'; Signers = @(); Thumbprints = @(); TrustStatus = 'not_checked'; Message = ('Не удалось надёжно определить всех подписантов CMS. Код {0}; HRESULT {1}. Автоматическое подписание этого файла запрещено.' -f $detail, $hr) }
     }
 
 }

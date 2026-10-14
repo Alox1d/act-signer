@@ -1,7 +1,7 @@
-﻿# Black-box entry-point integration checks. Synthetic PDF/signature bytes and crypto stubs only.
+﻿# Black-box entry-point integration checks. Synthetic arbitrary file/signature bytes and crypto stubs only.
 param(
     [string]$CandidateDirectory = $PSScriptRoot,
-    [string]$ArtifactDirectory = (Join-Path $PSScriptRoot 'entry-test-artifacts')
+    [string]$ArtifactDirectory = (Join-Path ([IO.Path]::GetTempPath()) ('CSPSigner-Entry-' + [guid]::NewGuid().ToString('N')))
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -46,7 +46,7 @@ function Get-ActCertificates {
 function Get-ActExistingSignatureInfo {
     param([byte[]]$PdfBytes, [byte[]]$SignatureBytes)
     Add-SyntheticEvent 'Inspect'
-    if (-not [Text.Encoding]::UTF8.GetString($PdfBytes).StartsWith('%PDF-1.4 SYNTHETIC')) { throw 'Unexpected synthetic PDF bytes.' }
+    if ($PdfBytes.Length -lt 2 -or $PdfBytes[0] -ne 0 -or $PdfBytes[1] -ne 255) { throw 'Unexpected synthetic binary document bytes.' }
     $text = [Text.Encoding]::UTF8.GetString($SignatureBytes)
     if ($text -eq 'SYNTHETIC_UNVERIFIABLE') {
         return [pscustomobject]@{ Status = 'unverifiable'; Thumbprints = @(); Message = 'SYNTHETIC PRECHECK ERROR' }
@@ -88,7 +88,7 @@ function Show-ActSignerWindow {
     $configuration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw | ConvertFrom-Json
     $discovery = & $CertificateProvider
     # Use the real entry point's provider and real Core.Get-ActPlan, not a fabricated plan.
-    $plan = & $PlanProvider $configuration.InputRoot $configuration.InputRoot signer ivanov
+    $plan = & $PlanProvider $configuration.InputRoot $configuration.InputRoot file_signer ivanov ([string[]]@($configuration.SourceFiles)) ([bool]$configuration.Recurse)
     return [pscustomobject]@{ Plan = $plan; CertificateInfo = $discovery.Certificates[0]; CopyOriginals = $false }
 }
 Export-ModuleMember -Function Show-ActSignerWindow
@@ -110,7 +110,7 @@ try {
     foreach ($case in $cases) {
         $caseRoot = Join-Path $testRoot $case.Name
         $app = Join-Path $caseRoot 'app'
-        $inputRoot = Join-Path $caseRoot 'SyntheticActs'
+        $inputRoot = Join-Path $caseRoot 'SyntheticFiles'
         [void][IO.Directory]::CreateDirectory($app)
         foreach ($name in @('Sign-Acts.ps1', 'ActSigner.Core.psm1', 'ActSigner.Console.psm1')) {
             Copy-Item -LiteralPath (Join-Path $CandidateDirectory $name) -Destination (Join-Path $app $name)
@@ -119,22 +119,33 @@ try {
         Write-SyntheticText (Join-Path $app 'ActSigner.UI.psm1') $uiStub
         Write-SyntheticText (Join-Path $app 'ActSigner.Settings.psm1') $settingsStub
         $unchanged = @{}
+        $sourceFiles = New-Object 'System.Collections.Generic.List[string]'
         for ($i = 0; $i -lt $case.Kinds.Count; $i++) {
             $directory = Join-Path $inputRoot ('{0:D2}-synthetic' -f $i)
             [void][IO.Directory]::CreateDirectory($directory)
-            $pdf = Join-Path $directory 'Акт_оказанных_услуг.pdf'
-            $pdfBytes = [Text.Encoding]::UTF8.GetBytes(('%PDF-1.4 SYNTHETIC {0} ITEM {1}' -f $case.Name, $i))
+            $fileName = @('report.docx','invoice.xml','payload.bin')[$i % 3]
+            $pdf = Join-Path $directory $fileName
+            $sourceFiles.Add($pdf)
+            $pdfBytes = [byte[]]@(0,255,128,13,10,$i)
             [IO.File]::WriteAllBytes($pdf, $pdfBytes)
             $unchanged[$pdf] = [Convert]::ToBase64String($pdfBytes)
             if ($case.Kinds[$i] -ne 'new') {
-                $signature = Join-Path $directory 'signature.sig'
+                $signature = Join-Path $directory ($fileName + '_ivanov.sig')
                 $signatureText = if ($case.Kinds[$i] -eq 'unverifiable') { 'SYNTHETIC_UNVERIFIABLE' } else { 'SYNTHETIC_VALID_DUPLICATE' }
                 $signatureBytes = [Text.Encoding]::UTF8.GetBytes($signatureText)
                 [IO.File]::WriteAllBytes($signature, $signatureBytes)
                 $unchanged[$signature] = [Convert]::ToBase64String($signatureBytes)
             }
         }
-        $configuration = [pscustomobject]@{ InputRoot = $inputRoot; Thumbprint = $thumbprint; SignError = $case.SignError }
+        $explicitFiles = @($sourceFiles.ToArray())
+        $recurse = $false
+        if ($case.Name -eq 'mixed') { $explicitFiles = @(); $recurse = $true }
+        else {
+            # If the entry loses explicit picker paths, this unrelated sibling
+            # would be signed too. Nonrecursive mode also must reach the planner.
+            [IO.File]::WriteAllText((Join-Path $inputRoot 'unselected.txt'), 'not chosen')
+        }
+        $configuration = [pscustomobject]@{ InputRoot = $inputRoot; Thumbprint = $thumbprint; SignError = $case.SignError; SourceFiles = $explicitFiles; Recurse = $recurse }
         Write-SyntheticText (Join-Path $app 'case.json') ($configuration | ConvertTo-Json)
         $entryPoint = Join-Path $app 'Sign-Acts.ps1'
         if ($entryPoint.Contains('"')) { throw 'Unexpected quote in synthetic test path.' }
@@ -177,7 +188,7 @@ try {
         }
         $events = [string]::Join(',', [string[]]@($counts.Events))
         Assert-Entry ($events -eq $case.Events) ($case.Name + ': wrong crypto event order: ' + $events)
-        $csvFiles = @(Get-ChildItem -LiteralPath (Join-Path $inputRoot '_ActSigner_logs') -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+        $csvFiles = @(Get-ChildItem -LiteralPath (Join-Path $inputRoot '_CSPSigner_logs') -Filter '*.csv' -File -ErrorAction SilentlyContinue)
         $statuses = ''
         Assert-Entry ($csvFiles.Count -eq 1) ($case.Name + ': expected one actual Core batch CSV.')
         if ($csvFiles.Count -eq 1) {
@@ -192,8 +203,10 @@ try {
         foreach ($path in $unchanged.Keys) {
             Assert-Entry ([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -eq $unchanged[$path]) ($case.Name + ': original synthetic PDF/neighbor signature changed.')
         }
-        $published = @(Get-ChildItem -LiteralPath $inputRoot -Filter 'signature_ivanov.sig' -Recurse -File)
-        Assert-Entry ($published.Count -eq $case.VerifyNew) ($case.Name + ': wrong number of newly published signatures.')
+        Assert-Entry (-not [IO.File]::Exists((Join-Path $inputRoot 'unselected.txt_ivanov.sig'))) ($case.Name + ': an unselected sibling was signed.')
+        Assert-Entry ($stdout.Contains('Выбрано файлов:')) ($case.Name + ': the entry must describe generic files in its selection summary.')
+        $published = @(Get-ChildItem -LiteralPath $inputRoot -Filter '*_ivanov.sig' -Recurse -File)
+        Assert-Entry ($published.Count -eq ($case.VerifyNew + $case.Inspect)) ($case.Name + ': wrong number of newly published signatures.')
         $reports.Add([pscustomobject]@{ Case = $case.Name; ExitCode = $exitCode; Counts = $counts; CsvStatuses = $statuses; PublishedSignatures = $published.Count })
         Write-Host ('CHECK {0}: exit={1}; sessions={2}; signs={3}; verifies={4}; closes={5}; inspections={6}; events={7}' -f $case.Name, $exitCode, $counts.NewSession, $counts.Sign, $counts.VerifyNew, $counts.Close, $counts.Inspect, $events)
     }

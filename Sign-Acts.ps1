@@ -29,7 +29,7 @@ try {
         }
     }
     catch { }
-    try { $Host.UI.RawUI.WindowTitle = 'Подпись актов через КриптоПро ' + $displayVersion } catch { }
+    try { $Host.UI.RawUI.WindowTitle = 'CSPSigner - подпись файлов через КриптоПро ' + $displayVersion } catch { }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -44,11 +44,13 @@ try {
         throw $cryptoStatus.Message
     }
 
-    Write-Host 'Подключите флешку или токен к Windows внутри VM.'
-    Write-Host 'В окне выберите папки, сертификат и акты для подписи.'
+    Write-Host 'Убедитесь, что носитель ключа доступен в этой Windows.'
+    Write-Host 'В окне выберите файлы или папку, затем сертификат для подписи.'
     $selection = Show-ActSignerWindow -CertificateProvider { Get-ActCertificates } -PlanProvider {
-        param($Root, $OutputRoot, $SignatureNaming, $SignerLabel)
-        Get-ActPlan -Root $Root -OutputRoot $OutputRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel
+        param($Root, $OutputRoot, $SignatureNaming, $SignerLabel, $SourceFiles, $Recurse)
+        $scope = @{}
+        if (@($SourceFiles).Count -gt 0) { $scope.SourceFiles = [string[]]$SourceFiles }
+        Get-ActPlan -Root $Root -OutputRoot $OutputRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel -AllFiles -Recurse:([bool]$Recurse) @scope
     }
     if ($null -eq $selection) {
         Write-Host 'Запуск отменён. Подписание не начиналось.'
@@ -59,11 +61,11 @@ try {
         Write-Host ('Сертификат: {0}' -f $certificate.DisplayName)
         Write-Host ('Действует до: {0:dd.MM.yyyy HH:mm}' -f $certificate.NotAfter)
         Write-Host ('Отпечаток: {0}' -f $certificate.Thumbprint)
-        Write-Host ('Выбрано актов: {0}' -f @($selection.Plan.Items).Count)
+        Write-Host ('Выбрано файлов: {0}' -f @($selection.Plan.Items).Count)
         Write-Host ('Результат: {0}' -f $selection.Plan.OutputRoot)
         Write-Host 'PIN вводите только в штатном окне КриптоПро или токена.'
         Write-Host 'Отмена запроса PIN остановит пакет. Уже готовые подписи сохранятся.'
-        Write-Host 'Сначала проверяем подписи рядом с актом. Повторную подпись тем же сертификатом пропускаем.'
+        Write-Host 'Сначала проверяем подписи рядом с файлом. Повторную подпись тем же сертификатом пропускаем.'
         Write-Host ''
 
         $signBlock = {
@@ -104,7 +106,7 @@ try {
                 Write-Host ('  Пропущен готовый файл: {0}' -f $Event.Item.RelativePath)
             }
         }
-        $logRoot = Join-Path $selection.Plan.OutputRoot '_ActSigner_logs'
+        $logRoot = Join-Path $selection.Plan.OutputRoot '_CSPSigner_logs'
         $result = Invoke-ActBatch -Plan $selection.Plan -Thumbprint $certificate.Thumbprint `
             -SignBlock $signBlock -VerifyBlock $verifyBlock -ExistingSignatureInspector $existingSignatureInspector -LogRoot $logRoot `
             -CopyOriginals:([bool]$selection.CopyOriginals) -OnProgress $progressBlock
@@ -122,7 +124,7 @@ try {
             Write-Host 'После устранения причины запустите программу снова: готовые подписи не перезаписываются.'
         }
         else {
-            if ($result.ErrorCount -gt 0) { Write-Host 'Обработка завершена с ошибками отдельных актов. Причины указаны в журнале.' -ForegroundColor Yellow }
+            if ($result.ErrorCount -gt 0) { Write-Host 'Обработка завершена с ошибками отдельных файлов. Причины указаны в журнале.' -ForegroundColor Yellow }
             Write-Host ('Обработка завершена. Новых подписей: {0}; пропущено: {1}.' -f $result.CompletedCount, $result.SkippedCount) -ForegroundColor Green
             if ($result.CompletedCount -gt 0) { Write-Host ('Новые файлы: {0}' -f $selection.Plan.OutputRoot) }
         }

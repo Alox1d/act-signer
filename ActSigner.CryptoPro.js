@@ -72,7 +72,8 @@
 
     function canonicalBase64(value, bytes) {
         var length = 4 * Math.ceil(bytes / 3);
-        check(bytes > 0 && value.length === length, "BINARY_LIMIT");
+        check(bytes >= 0 && value.length === length, "BINARY_LIMIT");
+        if (bytes === 0) return;
         check(/^[A-Za-z0-9+/]+={0,2}$/.test(value), "PROTOCOL");
         var padding = (3 - bytes % 3) % 3;
         var actual = value.charAt(value.length - 1) === "=" ? 1 : 0;
@@ -82,9 +83,9 @@
         if (padding === 2) check((alphabet.indexOf(value.charAt(value.length - 3)) & 15) === 0, "PROTOCOL");
     }
 
-    function inputBlob() {
+    function inputBlob(allowEmpty) {
         var bytes = numberLine(MAX_BYTES);
-        check(bytes > 0, "BINARY_LIMIT");
+        check(allowEmpty === true || bytes > 0, "BINARY_LIMIT");
         var remaining = 4 * Math.ceil(bytes / 3);
         var chunks = [];
         while (remaining > 0) {
@@ -102,15 +103,15 @@
         return chunks.join("");
     }
 
-    function exportedBlob(value, maximum) {
+    function exportedBlob(value, maximum, allowEmpty) {
         check(typeof value === "string", "PROTOCOL");
         var base64 = String(value).replace(/[ \t\r\n]/g, "");
-        check(base64.length > 0 && base64.length <= 4 * Math.ceil(maximum / 3), "BINARY_LIMIT");
+        check((allowEmpty === true || base64.length > 0) && base64.length <= 4 * Math.ceil(maximum / 3), "BINARY_LIMIT");
         check(base64.length % 4 === 0, "PROTOCOL");
         var padding = base64.charAt(base64.length - 1) === "=" ? 1 : 0;
         if (base64.charAt(base64.length - 2) === "=") padding++;
         var bytes = base64.length / 4 * 3 - padding;
-        check(bytes > 0 && bytes <= maximum, "BINARY_LIMIT");
+        check((allowEmpty === true || bytes > 0) && bytes <= maximum, "BINARY_LIMIT");
         canonicalBase64(base64, bytes);
         return { bytes: bytes, base64: base64 };
     }
@@ -263,7 +264,9 @@
             signer.AuthenticatedAttributes2.Add(attribute);
             stage = "SignedData.Create";
             var data = new ActiveXObject("CAdESCOM.CadesSignedData");
-            data.ContentEncoding = 1;
+            stage = "SignedData.ContentEncoding";
+            data.ContentEncoding = request.pdf === "" ? 0 : 1;
+            stage = "SignedData.Content";
             data.Content = request.pdf;
             stage = "SignedData.SignCades";
             return exportedBlob(data.SignCades(signer, 1, true, 0), MAX_BYTES);
@@ -285,6 +288,35 @@
         return actual;
     }
 
+    function verifyEmpty(request) {
+        // PowerShell first authenticates the exact zero-byte source and the
+        // selected embedded certificate with native CryptoAPI. This operation
+        // additionally performs full CAdES verification without a My-store lookup.
+        stage = "HashedData.Create";
+        var hash = new ActiveXObject("CAdESCOM.HashedData");
+        stage = "HashedData.Algorithm";
+        hash.Algorithm = request.hashAlgorithm;
+        stage = "HashedData.DataEncoding";
+        hash.DataEncoding = 0;
+        stage = "HashedData.Hash";
+        hash.Hash("");
+        stage = "HashedData.Value";
+        var value = hash.Value;
+        check(typeof value === "string", "PROTOCOL");
+        value = value.replace(/\s/g, "").toUpperCase();
+        check(/^[0-9A-F]+$/.test(value) && value.length === (request.hashAlgorithm === 101 ? 64 : 128), "PROTOCOL");
+        stage = "SignedData.Create";
+        var data = new ActiveXObject("CAdESCOM.CadesSignedData");
+        stage = "SignedData.VerifyHash";
+        data.VerifyHash(hash, request.signature, 1);
+        stage = "Signers.Count";
+        check(typeof data.Signers.Count === "number" && data.Signers.Count === 1, "SIGNER_COUNT");
+        stage = "Signer.Thumbprint";
+        var actual = normalizedThumbprint(data.Signers.Item(1).Certificate.Thumbprint);
+        check(actual === request.thumb, "SIGNER_MISMATCH");
+        return actual;
+    }
+
     function inspect(request) {
         stage = "SignedData.Create";
         var data = new ActiveXObject("CAdESCOM.CadesSignedData");
@@ -298,7 +330,7 @@
             stage = "SignedData.Content";
             // Enforce exact external-content binding, including implementations
             // which return embedded content when given an attached CMS.
-            var content = exportedBlob(data.Content, MAX_BYTES);
+            var content = exportedBlob(data.Content, MAX_BYTES, true);
             check(content.base64 === request.pdf, "CONTENT_BINDING");
             stage = "Signers.Count";
             var signers = data.Signers;
@@ -345,12 +377,17 @@
         var id = readLine(32);
         check(/^[0-9a-f]{32}$/.test(id), "PROTOCOL");
         var command = readLine(16);
-        check(/^(CHECK|DISCOVER|SELECT|SIGN|VERIFY|INSPECT|CLOSE)$/.test(command), "PROTOCOL");
+        check(/^(CHECK|DISCOVER|SELECT|SIGN|VERIFY|VERIFYEMPTY|INSPECT|CLOSE)$/.test(command), "PROTOCOL");
         var request = { id: id, command: command };
         if (command === "SELECT" || command === "SIGN") { request.kind = inputKind(); request.thumb = inputThumbprint(); }
-        if (command === "VERIFY") request.thumb = inputThumbprint();
-        if (command === "SIGN" || command === "VERIFY" || command === "INSPECT") request.pdf = inputBlob();
-        if (command === "VERIFY" || command === "INSPECT") request.signature = inputBlob();
+        if (command === "VERIFY" || command === "VERIFYEMPTY") request.thumb = inputThumbprint();
+        if (command === "VERIFYEMPTY") {
+            request.hashAlgorithm = numberLine(102);
+            check(request.hashAlgorithm === 101 || request.hashAlgorithm === 102, "PROTOCOL");
+        }
+        if (command === "SIGN" || command === "VERIFY" || command === "VERIFYEMPTY" || command === "INSPECT") request.pdf = inputBlob(true);
+        if (command === "VERIFYEMPTY") check(request.pdf === "", "PROTOCOL");
+        if (command === "VERIFY" || command === "VERIFYEMPTY" || command === "INSPECT") request.signature = inputBlob(false);
         check(readLine(3) === "END", "PROTOCOL");
         return request;
     }
@@ -402,8 +439,8 @@
                         line(selected.kind);
                         line(selected.thumb);
                         outputBlob(selected.blob);
-                    } else if (command === "VERIFY") {
-                        var thumb = verify(request);
+                    } else if (command === "VERIFY" || command === "VERIFYEMPTY") {
+                        var thumb = command === "VERIFYEMPTY" ? verifyEmpty(request) : verify(request);
                         beginResponse(request, "OK");
                         line(1);
                         line(thumb);

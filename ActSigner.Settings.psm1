@@ -7,22 +7,44 @@ function Get-ActSignerSettingsPath {
     if ([string]::IsNullOrWhiteSpace($localData)) {
         throw 'Не удалось определить папку настроек текущего пользователя.'
     }
-    return [IO.Path]::Combine($localData, 'ActSigner', 'settings.json')
+    return [IO.Path]::Combine($localData, 'CSPSigner', 'settings.json')
 }
 
 function Get-ActSignerSettings {
     [CmdletBinding()]
-    param([string]$Path)
+    param([string]$Path, [string]$LegacyPath)
 
     $settings = [pscustomobject]@{
         SourceRoot = ''
         SeparateOutputRoot = ''
         SaveBesideSources = $true
-        SignatureNaming = 'signer'
+        SignatureNaming = 'file_signer'
     }
     try {
-        if ([string]::IsNullOrWhiteSpace($Path)) { $Path = Get-ActSignerSettingsPath }
-        if (-not [IO.File]::Exists($Path)) { return $settings }
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $Path = Get-ActSignerSettingsPath
+            $LegacyPath = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData), 'ActSigner', 'settings.json')
+        }
+        if (-not [IO.File]::Exists($Path)) {
+            if ([string]::IsNullOrWhiteSpace($LegacyPath) -or -not [IO.File]::Exists($LegacyPath)) { return $settings }
+            $legacyFile = New-Object IO.FileInfo($LegacyPath)
+            if ($legacyFile.Length -gt 64KB) { return $settings }
+            $legacyJson = [IO.File]::ReadAllText($LegacyPath, [Text.Encoding]::UTF8)
+            if (-not $legacyJson.TrimStart().StartsWith('{')) { return $settings }
+            $legacy = ConvertFrom-Json -InputObject $legacyJson -ErrorAction Stop
+            if ($null -eq $legacy -or $legacy -is [array]) { return $settings }
+            $migrated = Get-ActSignerSettings -Path $LegacyPath
+            # An absent/invalid old naming field used the previous default.
+            $oldNaming = $legacy.PSObject.Properties['SignatureNaming']
+            if ($null -eq $oldNaming -or $oldNaming.Value -isnot [string] -or $oldNaming.Value -cnotin @('signer','document_signer','legacy','file_signer')) {
+                $migrated.SignatureNaming = 'signer'
+            }
+            # Use CreateNew semantics to avoid overwriting a profile created
+            # by another process while we were reading the old preferences.
+            [void](Save-ActSignerSettings -Path $Path -SourceRoot $migrated.SourceRoot -SeparateOutputRoot $migrated.SeparateOutputRoot -SaveBesideSources $migrated.SaveBesideSources -SignatureNaming $migrated.SignatureNaming -OnlyIfMissing)
+            if ([IO.File]::Exists($Path)) { return Get-ActSignerSettings -Path $Path }
+            return $migrated
+        }
         $file = New-Object IO.FileInfo($Path)
         if ($file.Length -gt 64KB) { return $settings }
         $json = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
@@ -39,7 +61,7 @@ function Get-ActSignerSettings {
             }
         }
         $naming=$loaded.PSObject.Properties['SignatureNaming']
-        if($null -ne $naming -and $naming.Value -is [string] -and $naming.Value -cin @('signer','document_signer','legacy')) { $settings.SignatureNaming=$naming.Value }
+        if($null -ne $naming -and $naming.Value -is [string] -and $naming.Value -cin @('file_signer','signer','document_signer','legacy')) { $settings.SignatureNaming=$naming.Value }
         $mode = $loaded.PSObject.Properties['SaveBesideSources']
         if ($null -ne $mode -and $mode.Value -is [bool]) {
             $settings.SaveBesideSources = $mode.Value
@@ -59,7 +81,8 @@ function Save-ActSignerSettings {
         [AllowEmptyString()][string]$SeparateOutputRoot = '',
         [bool]$SaveBesideSources = $true,
         [string]$Path,
-        [ValidateSet('signer','document_signer','legacy')][string]$SignatureNaming = 'signer'
+        [ValidateSet('file_signer','signer','document_signer','legacy')][string]$SignatureNaming = 'file_signer',
+        [switch]$OnlyIfMissing
     )
 
     $temporaryPath = $null
@@ -89,7 +112,10 @@ function Save-ActSignerSettings {
 
         # Same-directory replacement is atomic. Never delete the old settings
         # or fall back to writing over them if the replacement fails.
-        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporaryPath, $Path, [NullString]::Value) }
+        if ([IO.File]::Exists($Path)) {
+            if ($OnlyIfMissing) { return $false }
+            [IO.File]::Replace($temporaryPath, $Path, [NullString]::Value)
+        }
         else { [IO.File]::Move($temporaryPath, $Path) }
         $temporaryPath = $null
         return $true
