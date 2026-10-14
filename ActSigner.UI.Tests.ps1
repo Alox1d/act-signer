@@ -27,6 +27,9 @@ $certificate = [pscustomobject]@{
 }
 $items = @(for ($i = 0; $i -lt 20; $i++) {
     $relative = 'Synthetic-{0:D2}\Акт_оказанных_услуг.pdf' -f $i
+    if($i -eq 4){$relative='old\backup.zip'}
+    if($i -eq 5){$relative='old\backup.7z'}
+    if($i -eq 6){$relative='old\backup.tar.gz'}
     [pscustomobject]@{
         RelativePath = $relative; SourcePath = 'C:\SyntheticActs\' + $relative
         SignaturePath = 'C:\SyntheticOutput\' + $relative + '.my.sig'
@@ -100,7 +103,7 @@ $measure = {
         $intersection = [Drawing.Rectangle]::Intersect($body, $rowRect)
         if ($intersection.Height -eq $row.Height -and $intersection.Width -gt 0) { $fullRows++ }
     }
-    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -eq 'Найти файлы' -or $_.Text -eq 'Выбрать файлы...' -or $_.Text -eq 'Выбрать все доступные' -or $_.Text -eq 'Снять выбор' -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
+    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -in @('Найти файлы','Обновить список') -or $_.Text -eq 'Выбрать файлы...' -or $_.Text -in @('Выбрать все доступные','Выбрать все') -or $_.Text -in @('Снять выбор','Снять все') -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
     $buttonInfo = @($buttons | ForEach-Object { [pscustomobject]@{ Text = $_.Text; FullyVisible = [bool](& $fullyVisible $_); Enabled = $_.Enabled } })
     $namingBox = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format' })[0]
     $namingCaption = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -eq 'Имя подписи:' })[0]
@@ -204,7 +207,7 @@ $timer.Add_Tick({
             & $assert ($form.Text.StartsWith('CSPSigner ')) 'The application window must show the new product name.'
             $form.WindowState = 'Normal'
             $form.Size = New-Object Drawing.Size(1000, 700)
-            $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти файлы' })[0]
+            $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -in @('Найти файлы','Обновить список') })[0]
             $naming=@($controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format' })
             & $assert ($naming.Count -eq 1) 'A persistent filename format choice must be available.'
             if($naming.Count -ne 1){throw 'Missing signature naming control'}
@@ -232,7 +235,7 @@ $timer.Add_Tick({
             & $inspectDetails $false
             $output = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для файлов и подписей' })[0]
             $beside = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] -and $_.Text -eq 'Сохранять рядом с исходниками' })[0]
-            $find = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти файлы' })[0]
+            $find = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -in @('Найти файлы','Обновить список') })[0]
             if ($output.Parent -isnot [System.Windows.Forms.TableLayoutPanel]) { throw 'Separate-output field must be in its folder table.' }
             $outputRow = $output.Parent.GetRow($output)
             $outputControls = @($output.Parent.Controls | Where-Object { $output.Parent.GetRow($_) -eq $outputRow })
@@ -258,14 +261,43 @@ $timer.Add_Tick({
             $grid = $state.Grid
             & $assert ($state.Form.AcceptButton.Enabled) 'Signing plan action must be enabled for a single synthetic cert and new acts.'
             $newRows = @($grid.Rows | Where-Object { [bool]$_.Cells[0].Value })
-            & $assert ($newRows.Count -eq 16) 'Only the 16 new acts should initially be checked.'
+            & $assert ($newRows.Count -eq 13) 'Folder discovery must preselect new documents while leaving three archives unchecked.'
+            foreach($index in @(4,5,6)){& $assert (-not [bool]$grid.Rows[$index].Cells[0].Value) 'Archive files must stay visible without a default signing checkbox.'}
             for ($i = 0; $i -lt $items.Count; $i++) {
                 & $assert ([object]::ReferenceEquals($grid.Rows[$i].Tag, $items[$i])) ('Row Tag no longer maps to fixture item ' + $i)
                 & $assert ([string]$grid.Rows[$i].Cells[1].Value -eq [string]$items[$i].RelativePath) ('Displayed path differs from row Tag at ' + $i)
                 if ($i -ge 16) { & $assert (-not $grid.Rows[$i].Cells[0].ReadOnly) 'Existing signature must remain selectable for key-free verification.' }
             }
-            $clear = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Снять выбор' })[0]
-            $select = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать все доступные' })[0]
+            $clear = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -in @('Снять выбор','Снять все') })[0]
+            $select = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -in @('Выбрать все доступные','Выбрать все') })[0]
+            $grid.CurrentCell=$grid.Rows[2].Cells[1]
+            $grid.ClearSelection()
+            foreach($index in @(2,9,13)){$grid.Rows[$index].Selected=$true}
+            & $assert ($grid.SelectedRows.Count -eq 3) 'Users must be able to highlight multiple file rows.'
+            $key=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Space)
+            $onKey=$grid.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic')
+            [void]$onKey.Invoke($grid,[object[]]@($key))
+            foreach($index in @(2,9,13)){& $assert (-not [bool]$grid.Rows[$index].Cells[0].Value) 'Space must remove checkboxes from every highlighted row.'}
+            & $assert ([bool]$grid.Rows[3].Cells[0].Value -and [bool]$grid.Rows[14].Cells[0].Value) 'Group checkbox changes must leave unrelated rows unchanged.'
+            $menu=$grid.ContextMenuStrip
+            & $assert ($null -ne $menu) 'Highlighted rows must offer checkbox actions through their context menu.'
+            if($null -ne $menu){
+                $mark=@($menu.Items | Where-Object {$_.Text -eq 'Отметить выделенные'})
+                $unmark=@($menu.Items | Where-Object {$_.Text -eq 'Снять галочки с выделенных'})
+                & $assert ($mark.Count -eq 1 -and $unmark.Count -eq 1) 'The group menu must support both checking and unchecking.'
+                if($mark.Count -eq 1 -and $unmark.Count -eq 1){
+                    $mark[0].PerformClick()
+                    foreach($index in @(2,9,13)){& $assert ([bool]$grid.Rows[$index].Cells[0].Value) 'The context menu must check every highlighted row.'}
+                    $unmark[0].PerformClick()
+                    foreach($index in @(2,9,13)){& $assert (-not [bool]$grid.Rows[$index].Cells[0].Value) 'The context menu must uncheck every highlighted row.'}
+                    $mouse=[Windows.Forms.MouseEventArgs]::new([Windows.Forms.MouseButtons]::Right,1,0,0,0)
+                    $cellMouse=[Windows.Forms.DataGridViewCellMouseEventArgs]::new(1,14,0,0,$mouse)
+                    [void]$grid.GetType().GetMethod('OnCellMouseDown',[Reflection.BindingFlags]'Instance,NonPublic',$null,[type[]]@([Windows.Forms.DataGridViewCellMouseEventArgs]),$null).Invoke($grid,[object[]]@($cellMouse))
+                    & $assert ($grid.SelectedRows.Count -eq 1 -and $grid.Rows[14].Selected) 'Right-clicking an unhighlighted file must target that file rather than the previous group.'
+                    $unmark[0].PerformClick()
+                    & $assert (-not [bool]$grid.Rows[14].Cells[0].Value -and [bool]$grid.Rows[3].Cells[0].Value) 'The context menu must act on its clicked file without changing unrelated files.'
+                }
+            }
             $clear.PerformClick()
             & $assert (-not $state.Form.AcceptButton.Enabled) 'Zero checked acts must disable the plan action.'
             & $assert (@($grid.Rows | Where-Object { [bool]$_.Cells[0].Value }).Count -eq 0) 'Clear must uncheck all rows.'
@@ -275,6 +307,9 @@ $timer.Add_Tick({
             $grid.Rows[2].Cells[0].Value = $true
             $grid.Rows[19].Cells[0].Value = $true
             & $assert ($state.Form.AcceptButton.Text -eq 'Проверить и подписать (2)') 'Plan action must show the checkbox count.'
+            $find.PerformClick()
+            & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2 -and [bool]$grid.Rows[2].Cells[0].Value -and [bool]$grid.Rows[19].Cells[0].Value) 'Refreshing an unchanged folder must retain the exact checked paths.'
+            $clear.PerformClick();$grid.Rows[2].Cells[0].Value=$true;$grid.Rows[19].Cells[0].Value=$true
             # Show-ActSignerWindow only returns a plan. No signing/COM/PIN code is imported.
             $state.Phase = 3
             $timer.Stop()
@@ -287,6 +322,8 @@ $timer.Add_Tick({
             $state.Controls = @(& $walk $state.Form)
             $pick = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать файлы...' })
             if ($pick.Count -ne 1) { throw 'A multi-file picker must be available beside folder discovery.' }
+            $beside=@($state.Controls | Where-Object {$_ -is [Windows.Forms.CheckBox] -and $_.Text -eq 'Сохранять рядом с исходниками'})[0]
+            $beside.Checked=$true
             $pick[0].PerformClick()
             $grid = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.DataGridView] })[0]
             & $assert ($grid.Rows.Count -eq 2) 'The file picker must plan only the two chosen files, excluding an unselected sibling.'
@@ -294,10 +331,38 @@ $timer.Add_Tick({
             $plannedPaths = @($grid.Rows | ForEach-Object { $_.Tag.SourcePath } | Sort-Object)
             & $assert (($plannedPaths -join '|') -ceq (($pickedFiles | Sort-Object) -join '|')) 'The file picker must preserve exact chosen paths.'
             & $assert (@($grid.Rows | Where-Object { $_.Tag.SignaturePath.EndsWith('.docx_ivanov.sig') }).Count -eq 1) 'The new naming format must retain the document extension.'
+            & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2) 'Explicitly picked archives must be checked like explicitly picked documents.'
             $grid.Rows[1].Cells[0].Value = $false
+            $refreshList=@($state.Controls | Where-Object {$_ -is [Windows.Forms.Button] -and $_.Text -in @('Найти файлы','Обновить список')})[0]
+            $refreshList.PerformClick()
+            & $assert ($grid.Rows.Count -eq 2 -and @($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'Refreshing explicit files must preserve their scope and checkboxes without adding an unselected sibling.'
             $state.Phase = 31
             $timer.Stop()
             $state.Form.AcceptButton.PerformClick()
+        }
+        if ($state.Phase -eq 40) {
+            $forms=@([Windows.Forms.Application]::OpenForms)
+            if($forms.Count -eq 0){return}
+            $state.Form=$forms[0];$state.Controls=@(& $walk $state.Form)
+            $source=@($state.Controls | Where-Object {$_ -is [Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка с исходными файлами'})[0]
+            $browse=@($source.Parent.Controls | Where-Object {$_ -is [Windows.Forms.Button] -and $source.Parent.GetRow($_) -eq 0})[0]
+            $browse.PerformClick()
+            $grid=@($state.Controls | Where-Object {$_ -is [Windows.Forms.DataGridView]})[0]
+            & $assert ($grid.Rows.Count -eq 3) 'Confirming a source folder must populate its files without a separate find action.'
+            & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2) 'Automatic folder discovery must leave the archive unchecked and select both documents.'
+            $source.Text=$folderRoot+'\.'
+            & $assert ($grid.Rows.Count -eq 0) 'Editing a folder path must invalidate the previous preview.'
+            $enter=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Enter)
+            [void]$source.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($source,[object[]]@($enter))
+            & $assert ($grid.Rows.Count -eq 3 -and $enter.Handled -and $enter.SuppressKeyPress) 'Enter in the source field must refresh the folder preview without falling through to the signing action.'
+            & $assert ($state.Form.DialogResult -ne [Windows.Forms.DialogResult]::OK) 'Confirming a source path must not accept the signing plan.'
+            $output=@($state.Controls | Where-Object {$_ -is [Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для файлов и подписей'})[0]
+            $outputBrowse=@($output.Parent.Controls | Where-Object {$_ -is [Windows.Forms.Button] -and $output.Parent.GetRow($_) -eq $output.Parent.GetRow($output)})[0]
+            $savesBefore=$preferenceCalls.Count
+            $outputBrowse.PerformClick()
+            & $assert ($preferenceCalls.Count -gt $savesBefore -and $preferenceCalls[$preferenceCalls.Count-1].SeparateOutputRoot -ceq $folderOutputRoot) 'Confirming an output folder must immediately save that preference.'
+            $state.Phase=41;$timer.Stop();$state.Form.CancelButton.PerformClick()
+            return
         }
         if ($state.Phase -eq 10) {
             $forms = @([System.Windows.Forms.Application]::OpenForms)
@@ -365,9 +430,10 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'ActSigner.Core.psm1') -Force -Global -DisableNameChecking
     $pickerRoot = Join-Path ([IO.Path]::GetTempPath()) ('cspsigner-ui-picker-' + [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($pickerRoot)
-    $pickedFiles = @((Join-Path $pickerRoot 'report.docx'), (Join-Path $pickerRoot 'invoice.xml'))
+    $pickedFiles = @((Join-Path $pickerRoot 'report.docx'), (Join-Path $pickerRoot 'sample.zip'))
     foreach ($file in $pickedFiles) { [IO.File]::WriteAllBytes($file, [byte[]]@(0,255,128,13,10)) }
     [IO.File]::WriteAllText((Join-Path $pickerRoot 'unselected.csv'), 'must remain unselected')
+    [IO.File]::WriteAllBytes((Join-Path $pickerRoot 'sample.zip_ivanov.sig'),[byte[]]@(1,2,3))
     $state.Phase = 30; $state.Form = $null; $state.Error = $null; $state.Started = [datetime]::UtcNow
     try {
         $timer.Start()
@@ -383,6 +449,22 @@ try {
     finally {
         if ([IO.Directory]::Exists($pickerRoot)) { Remove-Item -LiteralPath $pickerRoot -Recurse -Force }
     }
+    $hasFolderPicker=(Get-Command Show-ActSignerWindow).Parameters.ContainsKey('FolderPickerProvider')
+    & $assert $hasFolderPicker 'Folder selection must support the automatic discovery flow.'
+    if($hasFolderPicker){
+        $folderRoot=Join-Path ([IO.Path]::GetTempPath()) ('cspsigner-ui-folder-'+[guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($folderRoot)
+        $folderOutputRoot=Join-Path $folderRoot 'output'
+        [void][IO.Directory]::CreateDirectory($folderOutputRoot)
+        try{
+            foreach($name in @('report.docx','invoice.xml','backup.zip')){[IO.File]::WriteAllBytes((Join-Path $folderRoot $name),[byte[]]@(1,2,3))}
+            $state.Phase=40;$state.Form=$null;$state.Error=$null;$state.Started=[datetime]::UtcNow
+            $timer.Start()
+            $folderResult=Show-ActSignerWindow -CertificateProvider $certificateProvider -FolderPickerProvider {param($Owner,$InitialDirectory,$ForOutput,$DocumentsRoot) if($ForOutput){return $folderOutputRoot};return $folderRoot}.GetNewClosure()
+            if($null -ne $state.Error){throw $state.Error}
+            & $assert ($state.Phase -eq 41 -and $null -eq $folderResult) 'The automatic folder-preview case must complete without signing.'
+        }finally{Remove-Item -LiteralPath $folderRoot -Recurse -Force}
+    }
 }
 catch { $failures.Add($_.Exception.Message) }
 finally {
@@ -395,4 +477,4 @@ finally {
 }
 foreach ($measurement in $measurements) { Write-Host ('MEASURE {0}: grid={1}x{2}, visible body={3}px, complete rows={4}' -f $measurement.Name, $measurement.GridWidth, $measurement.GridHeight, $measurement.VisibleBodyHeight, $measurement.FullyVisibleRows) }
 if ($failures.Count -gt 0) { throw ('UI regression check failed:' + [Environment]::NewLine + ($failures.ToArray() -join [Environment]::NewLine)) }
-Write-Host 'PASS: native Windows layout, checkbox counts, selected plan mapping, output mode round trip, and certificate dialogs/diagnostic failure.'
+Write-Host 'PASS: native Windows layout, grouped checkbox actions, archive defaults, automatic folder discovery, exact refresh scope, selected plan mapping and certificate diagnostics.'

@@ -25,13 +25,15 @@ In a VM, components and the key must be available inside the Windows guest. Runn
 
 1. Open **`Start.cmd`**.
 2. Choose output placement, certificate and signature naming format. **Подробнее** (details) shows certificate information and diagnostics.
-3. Select a source folder and click **Найти файлы** (find files) to scan it and its subfolders. Use **Выбрать файлы...** (select files) for individual documents.
+3. Select a source folder to scan it and its subfolders automatically. Confirm a pasted path with Enter. Use **Выбрать файлы...** (select files) for individual documents.
 4. Review the list, select files and click **Проверить и подписать** (check and sign).
 5. Enter the PIN in the standard CryptoPro or token dialog and wait for the console summary.
 
-If you change folders, certificate or naming format after discovery, rebuild the list.
+If you change folders, certificate or naming format after discovery, click **Обновить список** (refresh list). Refreshing the same list preserves checkboxes and an explicit file selection.
 
-Content formats are unrestricted: PDF, DOCX, XLSX, XML, ZIP, images and other files can be signed. Folder search skips signature files, `.tmp` files and application logs; the file picker can select these explicitly. A nested output folder is excluded from sources.
+Ctrl/Shift highlights a group of rows; Space toggles its checkboxes. Group actions are also available in the right-click menu. **Выбрать все** (select all) and **Снять все** (clear all) affect the whole list.
+
+Content formats are unrestricted: PDF, DOCX, XLSX, XML, ZIP, images and other files can be signed. Folder search skips signature files, `.tmp` files and application logs; the file picker can select these explicitly. A nested output folder is excluded from sources. Archives found during folder discovery remain visible but initially unchecked. Check them manually when needed; explicitly picked archives start checked.
 
 ## Output
 
