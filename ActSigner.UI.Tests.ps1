@@ -351,9 +351,11 @@ $timer.Add_Tick({
             [void]$source.Focus()
             $message=[Windows.Forms.Message]::Create($source.Handle,0x100,[IntPtr]([int][Windows.Forms.Keys]::Enter),[IntPtr]1)
             $processing=$source.PreProcessControlMessage([ref]$message)
+            & $assert ($processing -eq [Windows.Forms.PreProcessControlState]::MessageNeeded) 'Enter on an explicit-file preview must reach the source input handler.'
             if($processing -eq [Windows.Forms.PreProcessControlState]::MessageNeeded){
                 $enter=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Enter)
                 [void]$source.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($source,[object[]]@($enter))
+                & $assert ($enter.Handled -and $enter.SuppressKeyPress -and $state.Form.DialogResult -ne [Windows.Forms.DialogResult]::OK) 'Enter on explicit files must be handled without accepting the signing plan.'
             }
             & $assert ($grid.Rows.Count -eq 2 -and @($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'Enter on an unchanged source must preserve explicit-file scope without including unselected siblings.'
             $state.Phase = 31
