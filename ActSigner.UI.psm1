@@ -125,6 +125,7 @@ function Show-ActSignerWindow {
     $newLine = [Environment]::NewLine
     $state = @{
         Plan = $null
+        PreviewChecks = @{}
         SourceFiles = @()
         Recurse = $true
         Result = $null
@@ -582,7 +583,14 @@ function Show-ActSignerWindow {
     }.GetNewClosure()
 
     $invalidatePlan = {
+        param([bool]$ResetSelection=$false)
         if ($state.SuppressChanges) { return }
+        if($ResetSelection){$state.PreviewChecks=@{}}
+        elseif($ui.Grid.Rows.Count -gt 0){
+            [void]$ui.Grid.EndEdit()
+            $state.PreviewChecks=@{}
+            foreach($row in $ui.Grid.Rows){if($null -ne $row.Tag){$state.PreviewChecks[[string]$row.Tag.SourcePath]=[bool]$row.Cells[0].Value}}
+        }
         $state.Plan = $null
         $state.SuppressGridEvents = $true
         try { $ui.Grid.Rows.Clear() }
@@ -783,6 +791,7 @@ function Show-ActSignerWindow {
         if ($state.Busy) { return }
         $previousChecks=@{}
         if($PreserveSelection){
+            $previousChecks=$state.PreviewChecks.Clone()
             [void]$ui.Grid.EndEdit()
             foreach($row in $ui.Grid.Rows){if($null -ne $row.Tag){$previousChecks[[string]$row.Tag.SourcePath]=[bool]$row.Cells[0].Value}}
         }
@@ -802,7 +811,7 @@ function Show-ActSignerWindow {
             return
         }
         & $savePreferences
-        & $invalidatePlan
+        & $invalidatePlan (-not $PreserveSelection)
         $state.Busy = $true
         $ui.Form.UseWaitCursor = $true
         $ui.Find.Text = 'Поиск...'
@@ -856,6 +865,8 @@ function Show-ActSignerWindow {
                 $state.SuppressGridEvents = $false
             }
             $state.Plan = $plan
+            $state.PreviewChecks=@{}
+            foreach($row in $ui.Grid.Rows){if($null -ne $row.Tag){$state.PreviewChecks[[string]$row.Tag.SourcePath]=[bool]$row.Cells[0].Value}}
             $ui.Grid.ClearSelection()
         }
         catch {
@@ -878,7 +889,7 @@ function Show-ActSignerWindow {
         if ($state.SuppressChanges) { return }
         $state.SourceFiles = @(); $state.Recurse = $true
         & $syncOutputToSource
-        & $invalidatePlan
+        & $invalidatePlan $true
     }.GetNewClosure())
     $outputBox.Add_TextChanged({
         if ($state.SuppressChanges) { return }
@@ -896,9 +907,14 @@ function Show-ActSignerWindow {
     $sourceBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $outputBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $sourceBrowse.Add_Click({if(& $browseFolder $false){& $findActs $true}}.GetNewClosure())
+    # Claim Enter during WinForms preprocessing, before Form.AcceptButton.
+    $sourceBox.Add_PreviewKeyDown({
+        param($sender,$eventArgs)
+        if($eventArgs.KeyCode -eq [Windows.Forms.Keys]::Enter -and $eventArgs.Modifiers -eq [Windows.Forms.Keys]::None){$eventArgs.IsInputKey=$true}
+    })
     $sourceBox.Add_KeyDown({
         param($sender,$eventArgs)
-        if($eventArgs.KeyCode -eq [Windows.Forms.Keys]::Enter){$eventArgs.Handled=$true;$eventArgs.SuppressKeyPress=$true;& $findActs $true}
+        if($eventArgs.KeyCode -eq [Windows.Forms.Keys]::Enter -and $eventArgs.Modifiers -eq [Windows.Forms.Keys]::None){$eventArgs.Handled=$true;$eventArgs.SuppressKeyPress=$true;& $findActs (@($state.SourceFiles).Count -eq 0) $true}
     }.GetNewClosure())
     $outputBrowse.Add_Click({ [void](& $browseFolder $true) }.GetNewClosure())
     $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())

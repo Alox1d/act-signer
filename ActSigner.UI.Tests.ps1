@@ -309,6 +309,13 @@ $timer.Add_Tick({
             & $assert ($state.Form.AcceptButton.Text -eq 'Проверить и подписать (2)') 'Plan action must show the checkbox count.'
             $find.PerformClick()
             & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2 -and [bool]$grid.Rows[2].Cells[0].Value -and [bool]$grid.Rows[19].Cells[0].Value) 'Refreshing an unchanged folder must retain the exact checked paths.'
+            $naming=@($state.Controls | Where-Object {$_ -is [Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format'})[0]
+            $naming.SelectedIndex=0
+            $output.Text='C:\SyntheticChangedOutput'
+            $output.Text=$priorOutput
+            & $assert ($grid.Rows.Count -eq 0 -and -not $state.Form.AcceptButton.Enabled) 'Parameter changes must invalidate the preview before a fresh plan can be signed.'
+            $find.PerformClick()
+            & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2 -and [bool]$grid.Rows[2].Cells[0].Value -and [bool]$grid.Rows[19].Cells[0].Value) 'Naming and output changes must retain checked paths through repeated preview invalidation.'
             $clear.PerformClick();$grid.Rows[2].Cells[0].Value=$true;$grid.Rows[19].Cells[0].Value=$true
             # Show-ActSignerWindow only returns a plan. No signing/COM/PIN code is imported.
             $state.Phase = 3
@@ -336,6 +343,19 @@ $timer.Add_Tick({
             $refreshList=@($state.Controls | Where-Object {$_ -is [Windows.Forms.Button] -and $_.Text -in @('Найти файлы','Обновить список')})[0]
             $refreshList.PerformClick()
             & $assert ($grid.Rows.Count -eq 2 -and @($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'Refreshing explicit files must preserve their scope and checkboxes without adding an unselected sibling.'
+            $naming=@($state.Controls | Where-Object {$_ -is [Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format'})[0]
+            $naming.SelectedIndex=2
+            $refreshList.PerformClick()
+            & $assert ($grid.Rows.Count -eq 2 -and @($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'A filename-format change must retain exact file-picker scope and unchecked choices.'
+            $source=@($state.Controls | Where-Object {$_ -is [Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка с исходными файлами'})[0]
+            [void]$source.Focus()
+            $message=[Windows.Forms.Message]::Create($source.Handle,0x100,[IntPtr]([int][Windows.Forms.Keys]::Enter),[IntPtr]1)
+            $processing=$source.PreProcessControlMessage([ref]$message)
+            if($processing -eq [Windows.Forms.PreProcessControlState]::MessageNeeded){
+                $enter=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Enter)
+                [void]$source.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($source,[object[]]@($enter))
+            }
+            & $assert ($grid.Rows.Count -eq 2 -and @($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'Enter on an unchanged source must preserve explicit-file scope without including unselected siblings.'
             $state.Phase = 31
             $timer.Stop()
             $state.Form.AcceptButton.PerformClick()
@@ -350,12 +370,30 @@ $timer.Add_Tick({
             $grid=@($state.Controls | Where-Object {$_ -is [Windows.Forms.DataGridView]})[0]
             & $assert ($grid.Rows.Count -eq 3) 'Confirming a source folder must populate its files without a separate find action.'
             & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2) 'Automatic folder discovery must leave the archive unchecked and select both documents.'
-            $source.Text=$folderRoot+'\.'
-            & $assert ($grid.Rows.Count -eq 0) 'Editing a folder path must invalidate the previous preview.'
-            $enter=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Enter)
-            [void]$source.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($source,[object[]]@($enter))
-            & $assert ($grid.Rows.Count -eq 3 -and $enter.Handled -and $enter.SuppressKeyPress) 'Enter in the source field must refresh the folder preview without falling through to the signing action.'
-            & $assert ($state.Form.DialogResult -ne [Windows.Forms.DialogResult]::OK) 'Confirming a source path must not accept the signing plan.'
+            foreach($row in $grid.Rows){$row.Cells[0].Value=([IO.Path]::GetFileName([string]$row.Tag.SourcePath) -eq 'report.docx')}
+            foreach($editPath in @($false,$true)){
+                if($editPath){
+                    $source.Text=$folderRoot+'\.'
+                    & $assert ($grid.Rows.Count -eq 0) 'Editing a folder path must invalidate the previous preview.'
+                }
+                [void]$source.Focus()
+                # Run WinForms preprocessing before dispatching the key. Calling
+                # OnKeyDown alone bypasses Form.AcceptButton dialog-key routing.
+                $message=[Windows.Forms.Message]::Create($source.Handle,0x100,[IntPtr]([int][Windows.Forms.Keys]::Enter),[IntPtr]1)
+                $processing=$source.PreProcessControlMessage([ref]$message)
+                & $assert ($processing -eq [Windows.Forms.PreProcessControlState]::MessageNeeded) 'Enter in the source field must reach its input handler before the form signing action.'
+                if($processing -eq [Windows.Forms.PreProcessControlState]::MessageNeeded){
+                    $enter=[Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Enter)
+                    [void]$source.GetType().GetMethod('OnKeyDown',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($source,[object[]]@($enter))
+                    & $assert ($grid.Rows.Count -eq 3 -and $enter.Handled -and $enter.SuppressKeyPress) 'Enter in the source field must refresh the folder preview without falling through to the signing action.'
+                }
+                & $assert ($state.Form.DialogResult -ne [Windows.Forms.DialogResult]::OK) 'Confirming a source path must not accept the signing plan.'
+                if($editPath){
+                    & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 2) 'A changed source path must start a fresh discovery rather than reuse old checkboxes.'
+                }else{
+                    & $assert (@($grid.Rows | Where-Object {[bool]$_.Cells[0].Value}).Count -eq 1) 'Enter on an unchanged source folder must retain its checked paths.'
+                }
+            }
             $output=@($state.Controls | Where-Object {$_ -is [Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для файлов и подписей'})[0]
             $outputBrowse=@($output.Parent.Controls | Where-Object {$_ -is [Windows.Forms.Button] -and $output.Parent.GetRow($_) -eq $output.Parent.GetRow($output)})[0]
             $savesBefore=$preferenceCalls.Count
