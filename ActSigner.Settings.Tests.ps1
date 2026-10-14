@@ -16,7 +16,7 @@ try {
     Assert-Settings ($initial.SourceRoot -eq '') 'A new profile must not invent a source folder.'
     Assert-Settings ($initial.SaveBesideSources -eq $true) 'First launch must save beside each act.'
 
-    Assert-Settings ($initial.SignatureNaming -ceq 'signer') 'New profiles must default to signer filenames.'
+    Assert-Settings ($initial.SignatureNaming -ceq 'file_signer') 'New profiles must default to full-filename signer filenames.'
 
     $source = '\\VBOXSVR\Акты & архив\2026'
     $output = 'D:\Подписи пользователя\Отдельная папка'
@@ -62,13 +62,42 @@ try {
     Assert-Settings (-not $saved) 'Occupied destination should not be replaced.'
     Assert-Settings ([IO.File]::ReadAllText($keep) -ceq 'unchanged') 'Occupied destination contents were changed.'
     Assert-Settings (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($occupiedDestination)) -Filter '*.tmp' -Force).Count -eq 0) 'Failed atomic publication left a staging file.'
-    foreach($mode in @('signer','document_signer','legacy')) {
+    foreach($mode in @('file_signer','signer','document_signer','legacy')) {
         Assert-Settings (Save-ActSignerSettings -Path $path -SourceRoot $source -SeparateOutputRoot $output -SaveBesideSources $true -SignatureNaming $mode) 'Naming preference save failed.'
         $loaded=Get-ActSignerSettings -Path $path
         Assert-Settings ($loaded.SignatureNaming -ceq $mode -and $loaded.SourceRoot -ceq $source -and $loaded.SaveBesideSources) 'Naming preference damaged folder/mode settings.'
     }
     [IO.File]::WriteAllText($path,'{"SignatureNaming":"invalid","SourceRoot":"C:\\Synthetic"}')
-    Assert-Settings ((Get-ActSignerSettings -Path $path).SignatureNaming -ceq 'signer') 'Invalid naming mode must use the safe default.'
+    Assert-Settings ((Get-ActSignerSettings -Path $path).SignatureNaming -ceq 'file_signer') 'Invalid naming mode must use the safe default.'
+    # Migrating a profile must preserve folder choices and the explicitly chosen
+    # naming convention, omit unknown fields, and leave the old file untouched.
+    $legacyPath = Join-Path $testRoot 'ActSigner/settings.json'
+    $migratedPath = Join-Path $testRoot 'CSPSigner/settings.json'
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($legacyPath))
+    $legacyJson = '{"SourceRoot":"C:\\SyntheticLegacy","SeparateOutputRoot":"D:\\SyntheticOut","SaveBesideSources":false,"SignatureNaming":"document_signer","PIN":"must-not-copy"}'
+    [IO.File]::WriteAllText($legacyPath, $legacyJson)
+    $migrated = Get-ActSignerSettings -Path $migratedPath -LegacyPath $legacyPath
+    Assert-Settings ($migrated.SourceRoot -ceq 'C:\SyntheticLegacy' -and $migrated.SeparateOutputRoot -ceq 'D:\SyntheticOut' -and -not $migrated.SaveBesideSources -and $migrated.SignatureNaming -ceq 'document_signer') 'Legacy profile choices were lost during migration.'
+    Assert-Settings ([IO.File]::Exists($migratedPath)) 'The migrated profile must be saved at the new path.'
+    Assert-Settings ([IO.File]::ReadAllText($legacyPath) -ceq $legacyJson) 'Migration changed the old profile.'
+    $migratedRaw = ConvertFrom-Json ([IO.File]::ReadAllText($migratedPath))
+    Assert-Settings ($null -eq $migratedRaw.PSObject.Properties['PIN']) 'Migration copied an unrecognized field.'
+    Assert-Settings (Save-ActSignerSettings -Path $migratedPath -SourceRoot 'C:\NewProfile' -SignatureNaming file_signer) 'Could not seed new profile.'
+    $newBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($migratedPath))
+    $existing = Get-ActSignerSettings -Path $migratedPath -LegacyPath $legacyPath
+    Assert-Settings ($existing.SourceRoot -ceq 'C:\NewProfile' -and $existing.SignatureNaming -ceq 'file_signer') 'Legacy migration overwrote an existing new profile.'
+    Assert-Settings ([Convert]::ToBase64String([IO.File]::ReadAllBytes($migratedPath)) -ceq $newBytes) 'Loading an existing new profile changed its bytes.'
+    [IO.File]::WriteAllText($migratedPath, '{broken')
+    $existing = Get-ActSignerSettings -Path $migratedPath -LegacyPath $legacyPath
+    Assert-Settings ($existing.SourceRoot -eq '' -and $existing.SignatureNaming -ceq 'file_signer') 'A damaged new profile must not be silently replaced by an old profile.'
+    $oldMissing = Join-Path $testRoot 'OldMissing/settings.json'
+    [IO.File]::WriteAllText($legacyPath, '{"SourceRoot":"C:\\Older"}')
+    $missing = Get-ActSignerSettings -Path $oldMissing -LegacyPath $legacyPath
+    Assert-Settings ($missing.SourceRoot -ceq 'C:\Older' -and $missing.SignatureNaming -ceq 'signer' -and $missing.SaveBesideSources) 'An old profile with missing fields must retain its previous naming default.'
+    $badMigration = Join-Path $testRoot 'BadLegacy/settings.json'
+    [IO.File]::WriteAllText($legacyPath, '{broken')
+    $invalid = Get-ActSignerSettings -Path $badMigration -LegacyPath $legacyPath
+    Assert-Settings ($invalid.SignatureNaming -ceq 'file_signer' -and -not [IO.File]::Exists($badMigration)) 'Invalid legacy JSON must not produce a new profile.'
     Write-Host 'ActSigner.Settings tests passed.'
 }
 finally {

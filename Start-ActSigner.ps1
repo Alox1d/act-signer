@@ -29,7 +29,7 @@ function Get-ActNativePowerShell {
 }
 
 try {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'ActSigner запускается в Windows.' }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'CSPSigner запускается в Windows.' }
     # The guard also covers any launcher output before the signing process starts.
     try {
         Import-Module (Join-Path $PSScriptRoot 'ActSigner.Console.psm1') -Force -DisableNameChecking -ErrorAction Stop
@@ -56,7 +56,7 @@ try {
         Write-Verbose 'Обновление недоступно. Запускается версия из исходной папки.'
     }
     $entryPoint = Join-Path $applicationRoot 'Sign-Acts.ps1'
-    if (-not [IO.File]::Exists($entryPoint)) { throw 'В папке программы отсутствует Sign-Acts.ps1. Распакуйте полный архив ActSigner.' }
+    if (-not [IO.File]::Exists($entryPoint)) { throw 'В папке программы отсутствует Sign-Acts.ps1. Распакуйте полный архив CSPSigner.' }
 
     # This invocation's applicationRoot is fixed before the worker can prepare
     # another version. Downloading never holds the foreground application open.
@@ -101,7 +101,7 @@ try {
     $exitCode = $application.ExitCode
 }
 catch {
-    Write-Host ('Не удалось запустить ActSigner: ' + $_.Exception.Message) -ForegroundColor Red
+    Write-Host ('Не удалось запустить CSPSigner: ' + $_.Exception.Message) -ForegroundColor Red
     $exitCode = 1
 }
 finally {

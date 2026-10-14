@@ -32,7 +32,12 @@ function Assert-BridgeTest {
         Add-Type -Language CSharp -TypeDefinition @'
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 namespace ActSignerTests {
+    public static class ConsoleCodePage {
+        [DllImport("kernel32.dll")] public static extern uint GetConsoleCP();
+        [DllImport("kernel32.dll")] public static extern bool SetConsoleCP(uint codePage);
+    }
     public sealed class BridgeFake : IDisposable {
         public string[] Reply;
         public bool IsClosed;
@@ -70,6 +75,77 @@ namespace ActSignerTests {
     Assert-Case ([ActSigner.CScriptTransport]::QuoteArgument('a"b\') -ceq '"a\"b\\"') 'Quote and trailing backslash escaping.'
     Assert-Case ([ActSigner.CScriptTransport]::QuoteArgument('Каталог & [1]') -ceq '"Каталог & [1]"') 'Unicode and shell characters must stay one literal argument.'
 
+    # Exercise the real pipe writer against a script-host double without CAdESCOM.
+    # A zero-byte source is a length line only; signatures must stay nonempty.
+    $wireWorker = Join-Path ([IO.Path]::GetTempPath()) ('cspsigner-empty-wire-' + [Guid]::NewGuid().ToString('N') + '.js')
+    $wireProgram = @'
+function line(value) { WScript.StdOut.WriteLine(value); }
+function read(expected) { if (WScript.StdIn.ReadLine() !== expected) WScript.Quit(1); }
+while (true) {
+    read("ACTSIGNER/1");
+    var id = WScript.StdIn.ReadLine(), command = WScript.StdIn.ReadLine();
+    if (command === "SIGN") { read("100"); read("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
+    if (command === "VERIFY" || command === "VERIFYEMPTY") read("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    if (command === "VERIFYEMPTY") read("102");
+    if (command === "SIGN" || command === "VERIFY" || command === "VERIFYEMPTY" || command === "INSPECT") read("0");
+    if (command === "VERIFY" || command === "VERIFYEMPTY" || command === "INSPECT") { read("3"); read("YWJj"); }
+    read("END");
+    line("ACTSIGNER/1"); line(id); line("OK"); line(command);
+    if (command === "SIGN") { line("3"); line("YWJj"); }
+    if (command === "VERIFY" || command === "VERIFYEMPTY") { line("1"); line("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
+    if (command === "INSPECT") { line("valid"); line("1"); line("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); }
+    line("END");
+    if (command === "CLOSE") WScript.Quit(0);
+}
+'@
+    $callerInputEncoding=[Console]::InputEncoding
+    $callerInput=[Console]::In
+    $callerInputCodePage=[ActSignerTests.ConsoleCodePage]::GetConsoleCP()
+    try {
+        [IO.File]::WriteAllText($wireWorker, ($wireProgram -replace '\r?\n', "`r`n"), [Text.Encoding]::ASCII)
+      foreach($inputEncoding in @([Text.Encoding]::Default,[Text.UnicodeEncoding]::new($false,$true),[Text.UTF8Encoding]::new($true))) {
+        [Console]::InputEncoding=$inputEncoding
+        $nativeInputCodePage=[ActSignerTests.ConsoleCodePage]::GetConsoleCP()
+        [Console]::SetIn([IO.StringReader]::new('buffered caller input'))
+        $bufferedInput=[Console]::In
+        foreach ($command in @('SIGN', 'VERIFY', 'VERIFYEMPTY', 'INSPECT')) {
+            $wire = [ActSigner.CScriptTransport]::new((Get-ActCScriptPath), [string[]]@('//NoLogo','//U','//E:JScript',$wireWorker))
+            try {
+                Assert-Case ([Console]::InputEncoding.CodePage -eq $inputEncoding.CodePage -and [Convert]::ToBase64String([Console]::InputEncoding.GetPreamble()) -ceq [Convert]::ToBase64String($inputEncoding.GetPreamble())) 'Worker startup must restore the caller console input encoding, including its preamble.'
+                Assert-Case ([ActSignerTests.ConsoleCodePage]::GetConsoleCP() -eq $nativeInputCodePage) 'Worker startup must preserve the native console input code page, including Unicode callers.'
+                Assert-Case ([Object]::ReferenceEquals([Console]::In,$bufferedInput)) 'Worker startup must preserve the caller buffered console reader.'
+                $kind=if($command -ceq 'VERIFYEMPTY'){102}else{100}
+                $reply = $wire.Exchange($command, $kind, ('A' * 40), [byte[]]@(), [byte[]]@(97,98,99), 3000, 4096)
+                Assert-Case ($reply[2] -ceq 'OK' -and $reply[3] -ceq $command) 'Pipe framing must preserve a zero-byte source without an extra Base64 line.'
+                $wire.Finish(3000)
+            } finally { $wire.Dispose() }
+        }
+        Assert-Case ([Console]::In.ReadLine() -ceq 'buffered caller input') 'Worker startup must not consume or discard buffered console input.'
+        Must-Fail { [ActSigner.CScriptTransport]::new(($wireWorker+'.missing.exe'),[string[]]@()) } 'A missing worker executable must remain a startup failure.'
+        Assert-Case ([Console]::InputEncoding.CodePage -eq $inputEncoding.CodePage -and [Convert]::ToBase64String([Console]::InputEncoding.GetPreamble()) -ceq [Convert]::ToBase64String($inputEncoding.GetPreamble()) -and [Object]::ReferenceEquals([Console]::In,$bufferedInput) -and [ActSignerTests.ConsoleCodePage]::GetConsoleCP() -eq $nativeInputCodePage) 'Failed startup must restore console encoding, native code page and the existing input reader.'
+      }
+    } finally {
+        try{[Console]::InputEncoding=$callerInputEncoding}finally{[Console]::SetIn($callerInput);if($callerInputCodePage -ne 0){[void][ActSignerTests.ConsoleCodePage]::SetConsoleCP($callerInputCodePage)}}
+        Remove-Item -LiteralPath $wireWorker -Force
+    }
+
+    # Startup encoding normalization must not relax an operation deadline.
+    # This real synthetic worker never responds and must be killed promptly.
+    $stalledWorker=$wireWorker+'.stalled.js'
+    $stalledWire=$null
+    try {
+        [IO.File]::WriteAllText($stalledWorker,'WScript.StdIn.ReadLine(); WScript.Sleep(30000);',[Text.Encoding]::ASCII)
+        $stalledWire=[ActSigner.CScriptTransport]::new((Get-ActCScriptPath),[string[]]@('//NoLogo','//U','//E:JScript',$stalledWorker))
+        $deadlineClock=[Diagnostics.Stopwatch]::StartNew()
+        $deadlineFailure=$null
+        try{$stalledWire.Exchange('SIGN',100,('A'*40),[byte[]]@(),$null,300,4096)|Out-Null}catch{$deadlineFailure=$_.Exception.GetBaseException()}
+        $deadlineClock.Stop()
+        Assert-Case ($deadlineFailure -is [TimeoutException] -and $stalledWire.IsClosed -and $deadlineClock.ElapsedMilliseconds -lt 3000) 'A nonresponding worker must retain its hard deadline and close its transport.'
+    } finally {
+        if($null -ne $stalledWire){$stalledWire.Dispose()}
+        Remove-Item -LiteralPath $stalledWorker -Force
+    }
+
     $index = 0
     $bytes = Read-ActBridgeBlob @('3', 'YWJj') ([ref]$index)
     Assert-Case ($bytes -is [byte[]] -and [Text.Encoding]::ASCII.GetString($bytes) -ceq 'abc' -and $index -eq 2) 'Exact byte[] protocol decoding.'
@@ -100,6 +176,18 @@ namespace ActSignerTests {
     Assert-Case ($signature -is [byte[]] -and [Text.Encoding]::ASCII.GetString($signature) -ceq 'abc') 'Sign API must return one byte[] value.'
     Assert-Case ([Object]::ReferenceEquals($fake.Pdf, $snapshot)) 'Sign must submit the supplied snapshot, not reread a path.'
     Assert-Case ($fake.Kind -eq 100 -and $fake.Thumb -ceq $thumb -and $fake.Command -ceq 'SIGN') 'Selected source and thumbprint were not submitted.'
+
+    # Rejecting an empty source must not prevent signing a valid zero-byte file.
+    [byte[]]$emptySnapshot = @()
+    $emptyFake = New-Object ActSignerTests.BridgeFake
+    $emptyFake.Reply = Make-Frame 'SIGN' @('3', 'YWJj')
+    $emptySession = [pscustomobject]@{ Transport = $emptyFake; Thumbprint = $thumb; StoreKind = 100; Closed = $false }
+    $emptySignature = Invoke-ActCryptoSign $emptySession $emptySnapshot
+    Assert-Case ([Text.Encoding]::ASCII.GetString($emptySignature) -ceq 'abc' -and $emptyFake.Pdf.Length -eq 0) 'An empty source must produce a nonempty signature over the original zero bytes.'
+    $emptyFake.Reply = Make-Frame 'SIGN' @('0')
+    Must-Fail { Invoke-ActCryptoSign $emptySession $emptySnapshot } 'An empty signature response must fail even when the source is empty.'
+    Assert-Case ($emptySession.Closed -and $emptyFake.IsClosed) 'An invalid signature on empty content must close the signing session.'
+
     $fake.Reply = Make-Frame 'SIGN' @('3', 'YWJj', 'EXTRA')
     Must-Fail { Invoke-ActCryptoSign $session $snapshot } 'Malformed signature response must fail.'
     Assert-Case ($session.Closed -and $fake.IsClosed) 'A malformed sign response must close the session.'
@@ -108,13 +196,15 @@ namespace ActSignerTests {
     Assert-Case ($fake.Calls -eq $calls) 'Closed session sent an extra signing command.'
 
     foreach($hr in @('0x80090036','0x8010006E','0x800704C7','0x80004005')) {
+      foreach($command in @('SIGN','VERIFYEMPTY')) {
         $fake=New-Object ActSignerTests.BridgeFake
-        $fake.Reply=@('ACTSIGNER/1',('0'*32),'ERROR','SIGN','SignedData.SignCades','NATIVE',$hr,'END')
+        $fake.Reply=@('ACTSIGNER/1',('0'*32),'ERROR',$command,'SignedData.VerifyHash','NATIVE',$hr,'END')
         $failure=$null
-        try { Invoke-ActBridgeExchange $fake 'SIGN' | Out-Null } catch { $failure=$_.Exception }
+        try { Invoke-ActBridgeExchange $fake $command | Out-Null } catch { $failure=$_.Exception }
         Assert-Case ($null -ne $failure) 'Native signing error must fail.'
         $expected=if($hr -eq '0x80004005'){'session'}else{'cancelled'}
         Assert-Case ($failure.Data['ActSignerFailure'] -ceq $expected) 'Cancellation/session reason must survive the bridge as a typed error.'
+      }
     }
     $savedFactory = (Get-Item Function:New-ActBridgeTransport).ScriptBlock
     try {
@@ -123,6 +213,24 @@ namespace ActSignerTests {
         $script:ActTestTransport.Reply = Make-Frame 'VERIFY' @('1', $thumb)
         Test-ActCryptoSignature $snapshot ([byte[]]@(1, 2, 3)) $thumb
         Assert-Case ($script:ActTestTransport.Command -ceq 'VERIFY' -and $script:ActTestTransport.Finished -and $script:ActTestTransport.IsClosed) 'Verify must use and cleanly finish its separate worker.'
+
+        foreach($algorithm in @(@('1.2.643.7.1.1.1.1',101),@('1.2.643.7.1.1.1.2',102))) {
+            $signer=[pscustomobject]@{Thumbprint=$thumb;SignatureStatus='valid';PublicKeyOid=$algorithm[0]}
+            $hashAlgorithm=Get-ActEmptySignatureHashAlgorithm @($signer) $thumb
+            Assert-Case ($hashAlgorithm -eq $algorithm[1]) 'The verified signer public-key OID must choose the matching GOST hash.'
+            $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+            $script:ActTestTransport.Reply = Make-Frame 'VERIFYEMPTY' @('1', $thumb)
+            $payload=Invoke-ActBridgeOnce 'VERIFYEMPTY' $hashAlgorithm $thumb $emptySnapshot ([byte[]]@(1,2,3)) 600000
+            Assert-Case ($payload[0] -ceq '1' -and $script:ActTestTransport.Kind -eq $algorithm[1] -and $script:ActTestTransport.Command -ceq 'VERIFYEMPTY' -and $script:ActTestTransport.Pdf.Length -eq 0 -and $script:ActTestTransport.Maximum -eq 4096 -and $script:ActTestTransport.Finished -and $script:ActTestTransport.IsClosed) 'Empty full verification must use a bounded separate worker with the verified algorithm.'
+        }
+        foreach($signers in @(@(),@($signer,$signer),@([pscustomobject]@{Thumbprint=$thumb;SignatureStatus='unverifiable';PublicKeyOid='1.2.643.7.1.1.1.1'}),@([pscustomobject]@{Thumbprint=('B'*40);SignatureStatus='valid';PublicKeyOid='1.2.643.7.1.1.1.1'}),@([pscustomobject]@{Thumbprint=$thumb;SignatureStatus='valid';PublicKeyOid='1.2.643.7.1.1.3.2'}))) {
+            Must-Fail { Get-ActEmptySignatureHashAlgorithm $signers $thumb } 'Unverified, ambiguous, unexpected or unsupported signer metadata must not choose an empty-file hash algorithm.'
+        }
+        $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
+        $script:ActTestTransport.Reply = Make-Frame 'VERIFYEMPTY' @('1',$thumb)
+        Must-Fail { Test-ActCryptoSignature $emptySnapshot ([byte[]]@(1,2,3)) $thumb } 'Malformed empty-file CMS must fail its native gate.'
+        Assert-Case ($script:ActTestTransport.Calls -eq 0) 'A native failure must prevent empty-file full-verification worker requests.'
+        Must-Fail { Test-ActCryptoSignature $emptySnapshot ([byte[]]@()) $thumb } 'An empty detached signature must never pass verification.'
 
         foreach ($bad in @(@('2', $thumb), @('1', ('B' * 40)), @('1', $thumb, 'EXTRA'))) {
             $script:ActTestTransport = New-Object ActSignerTests.BridgeFake
@@ -196,7 +304,7 @@ function cert(thumb, options, stats) {
 function run(lines, options) {
     options = options || {};
     const input = lines.slice(), output = [];
-    const stats = { opens: [], sign: 0, verify: 0, eligibility: 0, creates: 0, attributes: 0, classes: [] };
+    const stats = { opens: [], sign: 0, verify: 0, hashVerify: 0, hashes: [], eligibility: 0, creates: 0, attributes: 0, classes: [] };
     const quit = {};
     let exit = null;
     const certificates = [cert(A, options, stats), cert(B, {}, stats)];
@@ -241,11 +349,24 @@ function run(lines, options) {
                 } } };
             }
             if (name === "CAdESCOM.CPAttribute") return {};
+            if (name === "CAdESCOM.HashedData") {
+                let algorithm = null, encoding = null, hashed = false;
+                return {
+                    set Algorithm(value) { assert([101, 102].includes(value)); algorithm = value; },
+                    get Algorithm() { return algorithm; },
+                    set DataEncoding(value) { assert.strictEqual(value, 0); encoding = value; },
+                    Hash: function (value) {
+                        assert.strictEqual(encoding, 0); assert.strictEqual(value, "");
+                        assert([101, 102].includes(algorithm)); hashed = true; stats.hashes.push(algorithm);
+                    },
+                    get Value() { assert(hashed); return "0".repeat(algorithm === 101 ? 64 : 128); }
+                };
+            }
             if (name === "CAdESCOM.CadesSignedData") {
                 let content = null, encoding = null;
                 const data = {
-                    set ContentEncoding(value) { assert.strictEqual(value, 1); encoding = value; },
-                    set Content(value) { assert.strictEqual(encoding, 1); content = value; },
+                    set ContentEncoding(value) { assert([0, 1].includes(value)); encoding = value; },
+                    set Content(value) { assert([0, 1].includes(encoding)); content = value; },
                     get Content() { return options.returnedContent === undefined ? content : options.returnedContent; },
                     SignCades: function (signer, type, detached, outputEncoding) {
                         stats.sign++;
@@ -254,6 +375,7 @@ function run(lines, options) {
                         assert.strictEqual(signer.Options, 2);
                         assert.strictEqual(type, 1); assert.strictEqual(detached, true); assert.strictEqual(outputEncoding, 0);
                         assert.strictEqual(content, options.pdf.toString("base64"));
+                        assert.strictEqual(encoding, options.pdf.length === 0 ? 0 : 1);
                         assert(stats.eligibility >= 2, "eligibility must be repeated before signing");
                         if (options.emptySignature) return "";
                         if (options.nullSignature) return null;
@@ -268,6 +390,17 @@ function run(lines, options) {
                             const error = new Error("UNSAFE_PROVIDER_DETAIL");
                             error.number = options.verifyErrorNumber === undefined ? -2146885628 : options.verifyErrorNumber;
                             throw error;
+                        }
+                    },
+                    VerifyHash: function (hash, signature, type) {
+                        stats.hashVerify++;
+                        assert.strictEqual(content, null); assert.strictEqual(encoding, null);
+                        assert.strictEqual(type, 1);
+                        assert.strictEqual(hash.Algorithm, options.hashAlgorithm);
+                        assert.strictEqual(hash.Value.length, options.hashAlgorithm === 101 ? 64 : 128);
+                        assert.strictEqual(signature, Buffer.from("MOCK-SIGNATURE").toString("base64"));
+                        if (options.verifyFails) {
+                            const error = new Error("UNSAFE_PROVIDER_DETAIL"); error.number = -2146762487; throw error;
                         }
                     },
                     Signers: {
@@ -306,6 +439,66 @@ for (let i = 0; i < pdf.length; i++) pdf[i] = i % 251;
 const select = request("SELECT", 1, ["100", A]);
 const sign = request("SIGN", 2, ["100", A].concat(blob(pdf)));
 const close = request("CLOSE", 9);
+test("zero-byte source is signed without an extra Base64 line", function () {
+    const empty = Buffer.alloc(0);
+    const result = run(select.concat(request("SIGN", 2, ["100", A].concat(blob(empty))), close), { pdf: empty });
+    assert.strictEqual(result.exit, 0);
+    assert.deepStrictEqual(result.frames[1].slice(4, -1), ["14", "TU9DSy1TSUdOQVRVUkU="]);
+    assert.strictEqual(result.remaining, 0);
+});
+for (const algorithm of [101, 102]) {
+    test("empty source full verification uses the selected GOST hash without stores or keys", function () {
+        const fields = [A, String(algorithm)].concat(blob(Buffer.alloc(0)), blob(Buffer.from("MOCK-SIGNATURE")));
+        const result = run(request("VERIFYEMPTY", 1, fields).concat(close), { hashAlgorithm: algorithm });
+        assert.strictEqual(result.exit, 0);
+        assert.deepStrictEqual(result.frames[0].slice(4, -1), ["1", A]);
+        assert.deepStrictEqual(result.stats.hashes, [algorithm]);
+        assert.strictEqual(result.stats.hashVerify, 1); assert.strictEqual(result.stats.verify, 0);
+        assert.deepStrictEqual(result.stats.classes, ["CAdESCOM.HashedData", "CAdESCOM.CadesSignedData"]);
+        assert.strictEqual(result.stats.eligibility, 0); assert.strictEqual(result.stats.opens.length, 0);
+        assert.strictEqual(result.stats.sign, 0); assert.strictEqual(result.remaining, 0);
+        for (const options of [{ otherSigner: true }, { signerCount: 0 }, { signerCount: 2 }, { signerCount: true }, { verifyFails: true }]) {
+            const failed = run(request("VERIFYEMPTY", 1, fields), Object.assign({ hashAlgorithm: algorithm }, options));
+            assert.strictEqual(failed.exit, 1); assert.strictEqual(failed.frames[0][2], "ERROR");
+            assert(!failed.output.join("").includes("UNSAFE_PROVIDER_DETAIL"));
+        }
+        const repeated = run(request("VERIFYEMPTY", 1, fields).concat(request("VERIFYEMPTY", 2, fields)), { hashAlgorithm: algorithm });
+        assert.strictEqual(repeated.exit, 1); assert.strictEqual(repeated.frames[1][5], "SESSION");
+        assert.strictEqual(repeated.stats.hashVerify, 1);
+    });
+}
+for (const fields of [
+    [A, "100", "0", "14", "TU9DSy1TSUdOQVRVUkU="],
+    [A, "0101", "0", "14", "TU9DSy1TSUdOQVRVUkU="],
+    [A, "101", "1", "YQ==", "14", "TU9DSy1TSUdOQVRVUkU="],
+    [A, "101", "0", "0"],
+    [A, "102", "0", "67108865"]
+]) {
+    test("invalid empty-hash verification rejected before COM", function () {
+        const result = run(request("VERIFYEMPTY", 1, fields));
+        assert.strictEqual(result.exit, 2); assert.strictEqual(result.stats.creates, 0);
+    });
+}
+test("inspection verifies empty content and rejects a nonempty readback", function () {
+    const empty = Buffer.alloc(0);
+    const fields = blob(empty).concat(blob(Buffer.from("MOCK-SIGNATURE")));
+    const result = run(request("INSPECT", 1, fields).concat(close), { pdf: empty, inspect: true });
+    assert.strictEqual(result.exit, 0);
+    assert.deepStrictEqual(result.frames[0].slice(4, -1), ["valid", "1", A]);
+    for (const returnedContent of [null, "YQ=="]) {
+        const failed = run(request("INSPECT", 1, fields).concat(close), { pdf: empty, inspect: true, returnedContent: returnedContent });
+        assert.strictEqual(failed.exit, 0);
+        assert.deepStrictEqual(failed.frames[0].slice(4, 6), ["unverifiable", "0"]);
+    }
+});
+for (const command of ["VERIFY", "INSPECT"]) {
+    test("empty signature rejected before COM even for empty content", function () {
+        const fields = (command === "VERIFY" ? [A] : []).concat(blob(Buffer.alloc(0)), ["0"]);
+        const result = run(request(command, 1, fields));
+        assert.strictEqual(result.exit, 2);
+        assert.strictEqual(result.stats.creates, 0);
+    });
+}
 test("persistent source selection and repeated signing", function () {
     const result = run(select.concat(sign, request("SIGN", 3, ["100", A].concat(blob(pdf))), close), { pdf: pdf });
     assert.strictEqual(result.exit, 0);
@@ -425,7 +618,6 @@ for (const options of [{ emptySignature: true }, { nullSignature: true }]) {
 }
 for (const fields of [
     ["100", A, "67108865"],
-    ["100", A, "0"],
     ["100", A, "1", "Zh=="],
     ["100", A, "3", "YW J"]
 ]) {

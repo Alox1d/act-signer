@@ -48,6 +48,9 @@ jobs:
       - name: Verify neighboring signature file rules
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Core.Tests.ps1
+      - name: Verify arbitrary files and mathematically bound sibling signatures
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\CSPSigner.Files.Tests.ps1
       - name: Verify CMS parsing and CScript bridge contracts
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.CryptoPro.Tests.ps1
@@ -113,7 +116,7 @@ jobs:
       - name: Build explicit runtime payload
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Build-Release.ps1 -OutputDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
-      - name: Create draft, upload and verify both assets, then publish stable latest
+      - name: Create draft, upload and verify all three assets, then publish stable latest
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}

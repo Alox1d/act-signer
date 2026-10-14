@@ -1,7 +1,7 @@
 ﻿# Native WinForms regression check. Synthetic metadata only; no files or signing provider.
 param(
     [string]$ModulePath = (Join-Path $PSScriptRoot 'ActSigner.UI.psm1'),
-    [string]$ArtifactDirectory = (Join-Path $PSScriptRoot 'ui-test-artifacts')
+    [string]$ArtifactDirectory = (Join-Path ([IO.Path]::GetTempPath()) ('CSPSigner-UI-' + [guid]::NewGuid().ToString('N')))
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -43,14 +43,15 @@ $syntheticReadError = 'SYNTHETIC CERTIFICATE READ FAILURE'
 $certificateProvider = { [pscustomobject]@{ Certificates = @($certificate); Warnings = @($syntheticWarning) } }.GetNewClosure()
 $providerCalls = @{ Count = 0; SourceRoot = ''; DestinationRoot = '' }
 $planProvider = {
-    param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel)
+    param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel, $SourceFiles, $Recurse)
     $providerCalls.SignatureNaming=$SignatureNaming; $providerCalls.SignerLabel=$SignerLabel
+    $providerCalls.SourceFiles = @($SourceFiles); $providerCalls.Recurse = [bool]$Recurse
     $providerCalls.Count++
     $providerCalls.SourceRoot = [string]$SourceRoot
     $providerCalls.DestinationRoot = [string]$DestinationRoot
     return [pscustomobject]@{
         Root = $SourceRoot; OutputRoot = $DestinationRoot; SeparateOutput = ($SourceRoot -ne $DestinationRoot)
-        Items = $fixturePlan.Items; SkippedReparsePoints = @()
+        Items = $fixturePlan.Items; SkippedReparsePoints = @(); AllFiles = $true; SourceFiles = @($SourceFiles); Recurse = [bool]$Recurse
     }
 }.GetNewClosure()
 $state = @{ Phase = 0; Form = $null; Grid = $null; Controls = @(); Error = $null; Started = [datetime]::UtcNow }
@@ -99,8 +100,13 @@ $measure = {
         $intersection = [Drawing.Rectangle]::Intersect($body, $rowRect)
         if ($intersection.Height -eq $row.Height -and $intersection.Width -gt 0) { $fullRows++ }
     }
-    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -eq 'Найти акты' -or $_.Text -eq 'Выбрать все доступные' -or $_.Text -eq 'Снять выбор' -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
+    $buttons = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and ($_.Text -eq 'Найти файлы' -or $_.Text -eq 'Выбрать файлы...' -or $_.Text -eq 'Выбрать все доступные' -or $_.Text -eq 'Снять выбор' -or $_ -eq $form.AcceptButton -or $_ -eq $form.CancelButton) })
     $buttonInfo = @($buttons | ForEach-Object { [pscustomobject]@{ Text = $_.Text; FullyVisible = [bool](& $fullyVisible $_); Enabled = $_.Enabled } })
+    $namingBox = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format' })[0]
+    $namingCaption = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -eq 'Имя подписи:' })[0]
+    $captionTop = $namingCaption.PointToScreen([Drawing.Point]::Empty).Y
+    $boxTop = $namingBox.PointToScreen([Drawing.Point]::Empty).Y
+    & $assert ([Math]::Abs($captionTop - $boxTop) -lt 15) ($Name + ': filename convention caption must stay beside its selector when the toolbar wraps.')
     $measurements.Add([pscustomobject]@{
         Name = $Name; WindowWidth = $form.Width; WindowHeight = $form.Height
         ClientWidth = $form.ClientSize.Width; ClientHeight = $form.ClientSize.Height
@@ -115,7 +121,7 @@ $measure = {
     }
     finally { $bitmap.Dispose() }
     & $assert ($fullRows -ge $MinimumRows) ($Name + ': only ' + $fullRows + ' complete act rows are visible; require ' + $MinimumRows + '.')
-    & $assert ($buttonInfo.Count -eq 5) ($Name + ': expected five primary/selection buttons.')
+    & $assert ($buttonInfo.Count -eq 6) ($Name + ': expected six primary/selection buttons.')
     foreach ($button in $buttonInfo) { & $assert $button.FullyVisible ($Name + ': button is clipped: ' + $button.Text) }
 }.GetNewClosure()
 
@@ -192,17 +198,18 @@ $timer.Add_Tick({
             if ($forms.Count -eq 0) { return }
             $form = $forms[0]
             $controls = @(& $walk $form)
-            $grid = @($controls | Where-Object { $_ -is [System.Windows.Forms.DataGridView] -and $_.AccessibleName -eq 'Предварительный список актов' })
+            $grid = @($controls | Where-Object { $_ -is [System.Windows.Forms.DataGridView] -and $_.AccessibleName -eq 'Предварительный список файлов' })
             if ($grid.Count -ne 1) { throw 'Expected one accessible act grid.' }
             $state.Form = $form; $state.Grid = $grid[0]; $state.Controls = $controls
+            & $assert ($form.Text.StartsWith('CSPSigner ')) 'The application window must show the new product name.'
             $form.WindowState = 'Normal'
             $form.Size = New-Object Drawing.Size(1000, 700)
-            $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
+            $find = @($controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти файлы' })[0]
             $naming=@($controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.AccessibleName -eq 'Signature filename format' })
             & $assert ($naming.Count -eq 1) 'A persistent filename format choice must be available.'
             if($naming.Count -ne 1){throw 'Missing signature naming control'}
-            & $assert ($naming[0].SelectedIndex -eq 0 -and $naming[0].Items.Count -eq 3) 'Default naming must use the signer surname with both alternatives available.'
-            $naming[0].SelectedIndex=1
+            & $assert ($naming[0].SelectedIndex -eq 0 -and $naming[0].Items.Count -eq 4) 'Default naming must retain the full filename and expose the three previous conventions.'
+            $naming[0].SelectedIndex=2
             $find.PerformClick()
             & $assert ($providerCalls.SignatureNaming -ceq 'document_signer' -and $providerCalls.SignerLabel -ceq 'ivanov') 'The plan must use the selected format and selected certificate surname.'
             & $assert ($state.Grid.Rows.Count -eq 20) 'The injected plan must populate all 20 acts.'
@@ -223,9 +230,9 @@ $timer.Add_Tick({
             # A nested timer inspects the real owned modal while ShowDialog runs.
             $state.Phase = 20
             & $inspectDetails $false
-            $output = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для PDF и подписей' })[0]
+            $output = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.TextBox] -and $_.AccessibleName -eq 'Папка для файлов и подписей' })[0]
             $beside = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] -and $_.Text -eq 'Сохранять рядом с исходниками' })[0]
-            $find = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти акты' })[0]
+            $find = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Найти файлы' })[0]
             if ($output.Parent -isnot [System.Windows.Forms.TableLayoutPanel]) { throw 'Separate-output field must be in its folder table.' }
             $outputRow = $output.Parent.GetRow($output)
             $outputControls = @($output.Parent.Controls | Where-Object { $output.Parent.GetRow($_) -eq $outputRow })
@@ -273,6 +280,25 @@ $timer.Add_Tick({
             $timer.Stop()
             $state.Form.AcceptButton.PerformClick()
         }
+        if ($state.Phase -eq 30) {
+            $forms = @([System.Windows.Forms.Application]::OpenForms)
+            if ($forms.Count -eq 0) { return }
+            $state.Form = $forms[0]
+            $state.Controls = @(& $walk $state.Form)
+            $pick = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq 'Выбрать файлы...' })
+            if ($pick.Count -ne 1) { throw 'A multi-file picker must be available beside folder discovery.' }
+            $pick[0].PerformClick()
+            $grid = @($state.Controls | Where-Object { $_ -is [System.Windows.Forms.DataGridView] })[0]
+            & $assert ($grid.Rows.Count -eq 2) 'The file picker must plan only the two chosen files, excluding an unselected sibling.'
+            if ($grid.Rows.Count -ne 2) { throw 'File picker selection was not used by the real planner.' }
+            $plannedPaths = @($grid.Rows | ForEach-Object { $_.Tag.SourcePath } | Sort-Object)
+            & $assert (($plannedPaths -join '|') -ceq (($pickedFiles | Sort-Object) -join '|')) 'The file picker must preserve exact chosen paths.'
+            & $assert (@($grid.Rows | Where-Object { $_.Tag.SignaturePath.EndsWith('.docx_ivanov.sig') }).Count -eq 1) 'The new naming format must retain the document extension.'
+            $grid.Rows[1].Cells[0].Value = $false
+            $state.Phase = 31
+            $timer.Stop()
+            $state.Form.AcceptButton.PerformClick()
+        }
         if ($state.Phase -eq 10) {
             $forms = @([System.Windows.Forms.Application]::OpenForms)
             if ($forms.Count -eq 0) { return }
@@ -316,6 +342,7 @@ try {
     & $assert (@($preferenceCalls | Where-Object {$_.SignatureNaming -ceq 'document_signer'}).Count -gt 0) 'The selected filename format must be saved.'
     & $assert ($null -ne $result) 'The UI must return the selected plan.'
     if ($null -ne $result) {
+        & $assert ($result.Plan.AllFiles -and $result.Plan.Recurse -and @($result.Plan.SourceFiles).Count -eq 0) 'Selected plans must retain the universal-file scope and recursion choice.'
         & $assert ($result.Plan.Items.Count -eq 2) 'Returned plan must contain exactly two checked acts.'
         & $assert ([object]::ReferenceEquals($result.Plan.Items[0], $items[2])) 'Returned first act must map to the row Tag.'
         & $assert ([object]::ReferenceEquals($result.Plan.Items[1], $items[19])) 'Returned second act must map to the row Tag.'
@@ -335,6 +362,27 @@ try {
     if ($null -ne $state.Error) { throw $state.Error }
     & $assert ($state.Phase -eq 12) 'Certificate read failure diagnostic scenario must complete.'
     & $assert ($null -eq $failureResult) 'Cancelling the diagnostic scenario must not return a signing plan.'
+    Import-Module (Join-Path $PSScriptRoot 'ActSigner.Core.psm1') -Force -Global -DisableNameChecking
+    $pickerRoot = Join-Path ([IO.Path]::GetTempPath()) ('cspsigner-ui-picker-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($pickerRoot)
+    $pickedFiles = @((Join-Path $pickerRoot 'report.docx'), (Join-Path $pickerRoot 'invoice.xml'))
+    foreach ($file in $pickedFiles) { [IO.File]::WriteAllBytes($file, [byte[]]@(0,255,128,13,10)) }
+    [IO.File]::WriteAllText((Join-Path $pickerRoot 'unselected.csv'), 'must remain unselected')
+    $state.Phase = 30; $state.Form = $null; $state.Error = $null; $state.Started = [datetime]::UtcNow
+    try {
+        $timer.Start()
+        $pickerResult = Show-ActSignerWindow -CertificateProvider $certificateProvider -FilePickerProvider { return @($pickedFiles) + @($pickedFiles[0]) }.GetNewClosure()
+        if ($null -ne $state.Error) { throw $state.Error }
+        & $assert ($state.Phase -eq 31 -and $null -ne $pickerResult) 'The file-picker scenario must return a selected plan.'
+        if ($null -ne $pickerResult) {
+            & $assert ($pickerResult.Plan.AllFiles -and -not $pickerResult.Plan.Recurse) 'An explicit file plan must retain its universal nonrecursive scope.'
+            & $assert ((@($pickerResult.Plan.SourceFiles | Sort-Object) -join '|') -ceq (($pickedFiles | Sort-Object) -join '|')) 'Checkbox filtering must retain the original explicit-file scope.'
+            & $assert ($pickerResult.Plan.Items.Count -eq 1 -and $pickedFiles -contains $pickerResult.Plan.Items[0].SourcePath) 'Only the checked file may be returned for signing.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($pickerRoot)) { Remove-Item -LiteralPath $pickerRoot -Recurse -Force }
+    }
 }
 catch { $failures.Add($_.Exception.Message) }
 finally {

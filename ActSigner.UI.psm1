@@ -47,7 +47,8 @@ function Show-ActSignerWindow {
     [CmdletBinding()]
     param(
         [scriptblock]$CertificateProvider,
-        [scriptblock]$PlanProvider
+        [scriptblock]$PlanProvider,
+        [scriptblock]$FilePickerProvider
     )
 
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
@@ -66,8 +67,28 @@ function Show-ActSignerWindow {
     }
     if ($null -eq $PlanProvider) {
         $PlanProvider = {
-            param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel)
-            Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel
+            param($SourceRoot, $DestinationRoot, $SignatureNaming, $SignerLabel, $SourceFiles, $Recurse)
+            $scope = @{}
+            if (@($SourceFiles).Count -gt 0) { $scope.SourceFiles = [string[]]$SourceFiles }
+            Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel -AllFiles -Recurse:([bool]$Recurse) @scope
+        }
+    }
+
+    if ($null -eq $FilePickerProvider) {
+        $FilePickerProvider = {
+            param($Owner, $InitialDirectory)
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            try {
+                $dialog.Title = 'Выберите файлы для подписи'
+                $dialog.Filter = 'Все файлы (*.*)|*.*'
+                $dialog.Multiselect = $true
+                $dialog.CheckFileExists = $true
+                $dialog.RestoreDirectory = $true
+                if ([IO.Directory]::Exists($InitialDirectory)) { $dialog.InitialDirectory = $InitialDirectory }
+                if ($dialog.ShowDialog($Owner) -eq [System.Windows.Forms.DialogResult]::OK) { return @($dialog.FileNames) }
+                return @()
+            }
+            finally { $dialog.Dispose() }
         }
     }
 
@@ -75,10 +96,10 @@ function Show-ActSignerWindow {
     if ([string]::IsNullOrWhiteSpace($documentsRoot)) {
         $documentsRoot = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile), 'Documents')
     }
-    $defaultOutput = [IO.Path]::Combine($documentsRoot, 'Подписанные_акты')
+    $defaultOutput = [IO.Path]::Combine($documentsRoot, 'Подписанные_файлы')
     $settings = Get-ActSignerSettings
-    $namingModes=@('signer','document_signer','legacy')
-    $initialNaming='signer'
+    $namingModes=@('file_signer','signer','document_signer','legacy')
+    $initialNaming='file_signer'
     if($null -ne $settings.PSObject.Properties['SignatureNaming'] -and $settings.SignatureNaming -cin $namingModes) { $initialNaming=$settings.SignatureNaming }
     if (-not [string]::IsNullOrWhiteSpace($settings.SeparateOutputRoot)) {
         $defaultOutput = $settings.SeparateOutputRoot
@@ -87,6 +108,8 @@ function Show-ActSignerWindow {
     $newLine = [Environment]::NewLine
     $state = @{
         Plan = $null
+        SourceFiles = @()
+        Recurse = $true
         Result = $null
         Certificates = @()
         CertificateWarnings = @()
@@ -123,7 +146,7 @@ function Show-ActSignerWindow {
         }
     }
     catch { }
-    $form.Text = 'Подписание актов ' + $displayVersion
+    $form.Text = 'CSPSigner ' + $displayVersion
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.Font = $baseFont
     $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
@@ -132,7 +155,7 @@ function Show-ActSignerWindow {
     $availableWidth = [Math]::Max(200, $workArea.Width - 32)
     $availableHeight = [Math]::Max(200, $workArea.Height - 32)
 
-    # Only the grid scrolls. Setup rows use their preferred height; the acts
+    # Only the grid scrolls. Setup rows use their preferred height; the files
     # receive the remaining space and the footer stays inside the window.
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.Dock = 'Fill'
@@ -146,7 +169,7 @@ function Show-ActSignerWindow {
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$form.Controls.Add($layout)
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'Подписать акты своей ЭП'
+    $title.Text = 'Подписать файлы своей ЭП'
     $title.Font = $titleFont
     $title.AutoSize = $true
     $title.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
@@ -178,7 +201,7 @@ function Show-ActSignerWindow {
         [void]$folders.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     }
     $sourceLabel = New-Object System.Windows.Forms.Label
-    $sourceLabel.Text = 'Папка с актами:'
+    $sourceLabel.Text = 'Папка исходников:'
     $sourceLabel.AutoSize = $true
     $sourceLabel.Anchor = 'Left'
     $sourceLabel.Margin = New-Object System.Windows.Forms.Padding(0, 4, 10, 4)
@@ -188,7 +211,7 @@ function Show-ActSignerWindow {
     $sourceBox.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
     $sourceBox.Text = $settings.SourceRoot
     $sourceBox.TabIndex = 0
-    $sourceBox.AccessibleName = 'Папка с исходными актами'
+    $sourceBox.AccessibleName = 'Папка с исходными файлами'
     $sourceBrowse = & $makeButton 'Выбрать...' 90
     $ui.SourceBrowse = $sourceBrowse
     $sourceBrowse.Dock = 'Fill'
@@ -220,7 +243,7 @@ function Show-ActSignerWindow {
     $outputBox.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
     $outputBox.Text = $defaultOutput
     $outputBox.TabIndex = 3
-    $outputBox.AccessibleName = 'Папка для PDF и подписей'
+    $outputBox.AccessibleName = 'Папка для файлов и подписей'
     $outputBrowse = & $makeButton 'Выбрать...' 90
     $ui.OutputBrowse = $outputBrowse
     $outputBrowse.Dock = 'Fill'
@@ -304,19 +327,24 @@ function Show-ActSignerWindow {
     $toolbar.Margin = New-Object System.Windows.Forms.Padding(0)
     $toolbar.WrapContents = $true
     $toolbar.TabIndex = 0
-    $find = & $makeButton 'Найти акты' 130 30
+    $find = & $makeButton 'Найти файлы' 130 30
     $ui.Find = $find
     $find.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
     $find.TabIndex = 0
     $selectNew = & $makeButton 'Выбрать все доступные' 155 30
     $ui.SelectNew = $selectNew
     $selectNew.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
-    $selectNew.TabIndex = 1
+    $selectNew.TabIndex = 2
     $clearSelection = & $makeButton 'Снять выбор' 115 30
     $ui.ClearSelection = $clearSelection
     $clearSelection.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
-    $clearSelection.TabIndex = 2
+    $clearSelection.TabIndex = 3
+    $pickFiles = & $makeButton 'Выбрать файлы...' 140 30
+    $ui.PickFiles = $pickFiles
+    $pickFiles.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
+    $pickFiles.TabIndex = 1
     [void]$toolbar.Controls.Add($find)
+    [void]$toolbar.Controls.Add($pickFiles)
     [void]$toolbar.Controls.Add($selectNew)
     [void]$toolbar.Controls.Add($clearSelection)
     $namingLabel=New-Object System.Windows.Forms.Label
@@ -326,15 +354,23 @@ function Show-ActSignerWindow {
     $naming=New-Object System.Windows.Forms.ComboBox
     $ui.Naming=$naming
     $naming.DropDownStyle='DropDownList'
-    $naming.Width=235
+    $naming.Width=280
     $naming.AccessibleName='Signature filename format'
     $naming.Margin=New-Object System.Windows.Forms.Padding(0,0,0,6)
+    [void]$naming.Items.Add('<файл.расширение>_<фамилия>.sig')
     [void]$naming.Items.Add('signature_<фамилия>.sig')
-    [void]$naming.Items.Add('<имя акта>_<фамилия>.sig')
-    [void]$naming.Items.Add('<имя акта>.my.sig (прежний)')
+    [void]$naming.Items.Add('<имя файла>_<фамилия>.sig')
+    [void]$naming.Items.Add('<имя файла>.my.sig (прежний)')
     $naming.SelectedIndex=[array]::IndexOf($namingModes,$initialNaming)
-    [void]$toolbar.Controls.Add($namingLabel)
-    [void]$toolbar.Controls.Add($naming)
+    $namingGroup = New-Object System.Windows.Forms.FlowLayoutPanel
+    $namingGroup.AutoSize = $true
+    $namingGroup.AutoSizeMode = 'GrowAndShrink'
+    $namingGroup.WrapContents = $false
+    $namingGroup.Margin = New-Object System.Windows.Forms.Padding(0)
+    $namingGroup.TabIndex = 4
+    [void]$namingGroup.Controls.Add($namingLabel)
+    [void]$namingGroup.Controls.Add($naming)
+    [void]$toolbar.Controls.Add($namingGroup)
     [void]$actLayout.Controls.Add($toolbar, 0, 0)
 
     $grid = New-Object System.Windows.Forms.DataGridView
@@ -363,7 +399,7 @@ function Show-ActSignerWindow {
         $grid.AlternatingRowsDefaultCellStyle.BackColor = [Drawing.Color]::FromArgb(248, 250, 252)
         $grid.GridColor = [Drawing.Color]::FromArgb(225, 229, 234)
     }
-    $grid.AccessibleName = 'Предварительный список актов'
+    $grid.AccessibleName = 'Предварительный список файлов'
     $grid.TabIndex = 1
     $checkColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
     $checkColumn.Name = 'Selected'
@@ -410,8 +446,8 @@ function Show-ActSignerWindow {
     $summary.Margin = New-Object System.Windows.Forms.Padding(0)
     $summary.AutoEllipsis = $true
     $summary.TextAlign = 'MiddleLeft'
-    $summary.Text = 'Выберите папку и нажмите Найти акты.'
-    $summary.AccessibleName = 'Итоги поиска и выбора актов'
+    $summary.Text = 'Выберите папку и нажмите Найти файлы.'
+    $summary.AccessibleName = 'Итоги поиска и выбора файлов'
     $sign = & $makeButton 'Проверить и подписать' 210 34
     $ui.Sign = $sign
     $sign.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
@@ -432,12 +468,13 @@ function Show-ActSignerWindow {
     $form.AcceptButton = $sign
     $form.CancelButton = $cancel
 
-    $toolTip.SetToolTip($sourceBox, 'Можно выбрать папку или вставить путь, включая общую папку VM. Поиск включает подпапки.')
-    $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут PDF и новые подписи.')
-    $toolTip.SetToolTip($beside, 'Каждая новая подпись сохраняется в той же подпапке, где найден её PDF. Подпапки должны быть доступны для записи.')
-    $toolTip.SetToolTip($find, 'Ищем Акт_оказанных_услуг.pdf и Акт_выполненных_работ.pdf, включая имена с пробелами и копии (1). Печатные формы пропускаются.')
+    $toolTip.SetToolTip($sourceBox, 'Выберите папку или вставьте путь. Кнопка Найти файлы просматривает её и подпапки. Для отдельных файлов используйте Выбрать файлы.')
+    $toolTip.SetToolTip($outputBox, 'Папка будет создана при подписании. При отдельной папке в неё попадут копии файлов и новые подписи.')
+    $toolTip.SetToolTip($beside, 'Каждая новая подпись сохраняется в той же подпапке, где найден её исходный файл. Подпапки должны быть доступны для записи.')
+    $toolTip.SetToolTip($find, 'Просмотреть все обычные файлы в папке и подпапках. Подписи, временные файлы и журналы CSPSigner пропускаются.')
+    $toolTip.SetToolTip($pickFiles, 'Выбрать один или несколько файлов любого формата. Будут добавлены только выбранные файлы.')
     $toolTip.SetToolTip($details, 'Полные данные выбранного сертификата и сообщения диагностики.')
-    $sign.AccessibleDescription = 'Сначала проверим соседние подписи. Уже подписанные выбранным сертификатом акты будут пропущены. Для остальных создадим новую подпись. Обработка продолжится в консоли; КриптоПро может запросить PIN носителя.'
+    $sign.AccessibleDescription = 'Сначала проверим соседние подписи. Уже подписанные выбранным сертификатом файлы будут пропущены. Для остальных создадим новую подпись. Обработка продолжится в консоли; КриптоПро может запросить PIN носителя.'
     $toolTip.SetToolTip($sign, $sign.AccessibleDescription)
 
     $formatDate = {
@@ -503,6 +540,7 @@ function Show-ActSignerWindow {
         $ui.Find.Enabled = (-not $state.Busy) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Source.Text)) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Output.Text))
+        $ui.PickFiles.Enabled = -not $state.Busy
         $ui.SelectNew.Enabled = (-not $state.Busy) -and ($newCount + $existingCount) -gt 0
         $ui.ClearSelection.Enabled = (-not $state.Busy) -and $selectedCount -gt 0
         $ui.Refresh.Enabled = -not $state.Busy
@@ -519,7 +557,7 @@ function Show-ActSignerWindow {
             $text = 'Найдено: {0}   |   Выбрано: {1}   |   Есть целевая подпись: {2}' -f $ui.Grid.Rows.Count, $selectedCount, $existingCount
             $skippedCount = @($state.Plan.SkippedReparsePoints).Count
             if ($skippedCount -gt 0) { $text += '   |   Пропущено ссылок: ' + $skippedCount }
-            if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие акты в этой папке и её подпапках не найдены.' }
+            if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие файлы в этой папке и её подпапках не найдены.' }
             $ui.Summary.Text = $text
             $toolTip.SetToolTip($ui.Summary, $text)
         }
@@ -531,7 +569,7 @@ function Show-ActSignerWindow {
         $state.SuppressGridEvents = $true
         try { $ui.Grid.Rows.Clear() }
         finally { $state.SuppressGridEvents = $false }
-        $ui.Summary.Text = 'Папки изменены. Нажмите Найти акты, чтобы проверить новый список.'
+        $ui.Summary.Text = 'Выбор изменён. Найдите файлы в папке или выберите их отдельно.'
         $toolTip.SetToolTip($ui.Summary, $ui.Summary.Text)
         & $syncAction
     }.GetNewClosure()
@@ -721,7 +759,7 @@ function Show-ActSignerWindow {
                 $candidate = $ui.Output.Text.Trim()
             }
             else {
-                $dialog.Description = 'Выберите папку с актами. Будут просмотрены и её подпапки.'
+                $dialog.Description = 'Выберите папку с файлами. Будут просмотрены и её подпапки.'
                 $candidate = $ui.Source.Text.Trim()
             }
             if ([IO.Directory]::Exists($candidate)) { $dialog.SelectedPath = $candidate }
@@ -737,15 +775,17 @@ function Show-ActSignerWindow {
     }.GetNewClosure()
 
     $findActs = {
+        param([bool]$ScanFolder = $true)
         if ($state.Busy) { return }
+        if ($ScanFolder) { $state.SourceFiles = @(); $state.Recurse = $true }
         $sourceRoot = $ui.Source.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
-            & $showError 'Выберите папку с актами.'
+            & $showError 'Выберите папку с файлами.'
             [void]$ui.Source.Focus()
             return
         }
         # Use the mode directly. With the same root, Core keeps each signature
-        # next to its own source PDF, including PDFs in different subfolders.
+        # next to its own source file, including files in different subfolders.
         $destinationRoot = if ($ui.Beside.Checked) { $sourceRoot } else { $ui.Output.Text.Trim() }
         if ([string]::IsNullOrWhiteSpace($destinationRoot)) {
             & $showError 'Укажите папку результата.'
@@ -757,7 +797,7 @@ function Show-ActSignerWindow {
         $state.Busy = $true
         $ui.Form.UseWaitCursor = $true
         $ui.Find.Text = 'Поиск...'
-        $ui.Summary.Text = 'Ищем акты в выбранной папке и её подпапках...'
+        $ui.Summary.Text = 'Строим список исходных файлов...'
         & $syncAction
         $ui.Form.Refresh()
         try {
@@ -770,8 +810,8 @@ function Show-ActSignerWindow {
                 if($null -ne $info.PSObject.Properties['FileLabel']) { $signerLabel=[string]$info.FileLabel }
                 else { $signerLabel='cert_'+([string]$info.Thumbprint).Substring(0,12).ToLowerInvariant() }
             }
-            $plan = & $PlanProvider $sourceRoot $destinationRoot $signatureNaming $signerLabel
-            if ($null -eq $plan) { throw 'Не удалось построить список актов.' }
+            $plan = & $PlanProvider $sourceRoot $destinationRoot $signatureNaming $signerLabel $state.SourceFiles $state.Recurse
+            if ($null -eq $plan) { throw 'Не удалось построить список файлов.' }
             $state.SuppressGridEvents = $true
             $ui.Grid.SuspendLayout()
             try {
@@ -787,14 +827,14 @@ function Show-ActSignerWindow {
                     $row = $ui.Grid.Rows[$rowIndex]
                     $row.Tag = $item
                     $row.Cells[0].ReadOnly = $false
-                    $row.Cells[1].ToolTipText = 'Исходный PDF: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
+                    $row.Cells[1].ToolTipText = 'Исходный файл: ' + [string]$item.SourcePath + $newLine + 'Подпись: ' + [string]$item.SignaturePath
                     $row.Cells[2].ToolTipText = [string]$item.SignaturePath
                     if (-not $existing -and $neighborCount -gt 0) {
-                        $row.Cells[2].ToolTipText = 'Соседние подписи найдены, но ещё не проверены. Галочка включает акт в проверку. Если математическая проверка подтвердит подпись точных байтов PDF выбранным сертификатом, повторной подписи не будет.'
+                        $row.Cells[2].ToolTipText = 'Соседние подписи найдены, но ещё не проверены. Галочка включает файл в проверку. Если математическая проверка подтвердит подпись точных байтов файла выбранным сертификатом, повторной подписи не будет.'
                     }
                     if ($existing) {
                         $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText
-                        $row.Cells[0].ToolTipText = 'Можно отметить для проверки существующей подписи. Подтверждённая подпись выбранного сертификата пропускается без ключа; неопределённая блокирует этот акт. Файл подписи не перезаписывается.'
+                        $row.Cells[0].ToolTipText = 'Можно отметить для проверки существующей подписи. Подтверждённая подпись выбранного сертификата пропускается без ключа; неопределённая блокирует этот файл. Файл подписи не перезаписывается.'
                     }
                 }
             }
@@ -811,18 +851,19 @@ function Show-ActSignerWindow {
             try { $ui.Grid.Rows.Clear() }
             finally { $state.SuppressGridEvents = $false }
             $ui.Summary.Text = 'Поиск не завершён. Проверьте пути и доступ к исходной папке.'
-            & $showError $_.Exception.Message 'Не удалось найти акты'
+            & $showError $_.Exception.Message 'Не удалось найти файлы'
         }
         finally {
             $state.Busy = $false
             $ui.Form.UseWaitCursor = $false
-            $ui.Find.Text = 'Найти акты'
+            $ui.Find.Text = 'Найти файлы'
             & $syncAction
         }
     }.GetNewClosure()
 
     $sourceBox.Add_TextChanged({
         if ($state.SuppressChanges) { return }
+        $state.SourceFiles = @(); $state.Recurse = $true
         & $syncOutputToSource
         & $invalidatePlan
     }.GetNewClosure())
@@ -846,7 +887,23 @@ function Show-ActSignerWindow {
     $refresh.Add_Click({ & $refreshCertificates }.GetNewClosure())
     $details.Add_Click({ & $openCertificateDetails }.GetNewClosure())
     $certificateBox.Add_SelectedIndexChanged({ & $invalidatePlan; & $showCertificate }.GetNewClosure())
-    $find.Add_Click({ & $findActs }.GetNewClosure())
+    $find.Add_Click({ & $findActs $true }.GetNewClosure())
+    $pickFiles.Add_Click({
+        if ($state.Busy) { return }
+        try {
+            $chosen = @(& $FilePickerProvider $ui.Form $ui.Source.Text.Trim() | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            if ($chosen.Count -eq 0) { return }
+            $sourceRoot = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath([string]$chosen[0]))
+            $state.SuppressChanges = $true
+            try { $ui.Source.Text = $sourceRoot }
+            finally { $state.SuppressChanges = $false }
+            $state.SourceFiles = [string[]]$chosen
+            $state.Recurse = $false
+            & $syncOutputToSource
+            & $findActs $false
+        }
+        catch { & $showError $_.Exception.Message 'Не удалось выбрать файлы' }
+    }.GetNewClosure())
     $grid.Add_CurrentCellDirtyStateChanged({
         if ($ui.Grid.IsCurrentCellDirty) {
             [void]$ui.Grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
@@ -889,8 +946,11 @@ function Show-ActSignerWindow {
                     $selectedItems.Add($row.Tag)
                 }
             }
-            if ($selectedItems.Count -eq 0) { throw 'Отметьте хотя бы один акт для проверки или подписания.' }
+            if ($selectedItems.Count -eq 0) { throw 'Отметьте хотя бы один файл для проверки или подписания.' }
             $selectedPlan = [pscustomobject]@{
+                AllFiles = $(if ($null -ne $state.Plan.PSObject.Properties['AllFiles']) { [bool]$state.Plan.AllFiles } else { $true })
+                Recurse = $(if ($null -ne $state.Plan.PSObject.Properties['Recurse']) { [bool]$state.Plan.Recurse } else { [bool]$state.Recurse })
+                SourceFiles = @(if ($null -ne $state.Plan.PSObject.Properties['SourceFiles']) { $state.Plan.SourceFiles } else { $state.SourceFiles })
                 Root = $state.Plan.Root
                 OutputRoot = $state.Plan.OutputRoot
                 SeparateOutput = [bool]$state.Plan.SeparateOutput
