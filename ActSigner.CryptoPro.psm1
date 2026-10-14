@@ -20,6 +20,7 @@ namespace ActSigner {
     public sealed class CScriptTransport : IDisposable {
         private const int ChunkBytes = 36864;
         private const int ChunkChars = 49152;
+        private static readonly object inputEncodingSync = new object();
         private readonly object sync = new object();
         private Process process;
         private StreamWriter input;
@@ -65,7 +66,7 @@ namespace ActSigner {
             process = new Process();
             process.StartInfo = info;
             try {
-                if (!process.Start()) throw new IOException("The script host did not start.");
+                if (!StartWithoutInputPreamble(process)) throw new IOException("The script host did not start.");
                 // //U applies to redirected input as well as output. The protocol
                 // alphabet is ASCII; its wire encoding is UTF-16LE, without a BOM.
                 input = new StreamWriter(process.StandardInput.BaseStream, wire, 8192);
@@ -75,6 +76,36 @@ namespace ActSigner {
             } catch {
                 Dispose();
                 throw;
+            }
+        }
+
+        private static bool StartWithoutInputPreamble(Process target) {
+            // .NET Framework creates an AutoFlush stdin writer during Start.
+            // A BOM-bearing Console.InputEncoding writes a preamble before our
+            // UTF-16LE writer takes over the pipe. Keep that prefix out of the
+            // wire without changing the caller's encoding or buffered reader.
+            lock (inputEncodingSync) {
+                Encoding originalEncoding = Console.InputEncoding;
+                if (originalEncoding.GetPreamble().Length == 0) return target.Start();
+                Encoding startupEncoding;
+                switch (originalEncoding.CodePage) {
+                    case 65001: startupEncoding = new UTF8Encoding(false); break;
+                    case 1200: startupEncoding = new UnicodeEncoding(false, false); break;
+                    case 1201: startupEncoding = new UnicodeEncoding(true, false); break;
+                    case 12000: startupEncoding = new UTF32Encoding(false, false); break;
+                    case 12001: startupEncoding = new UTF32Encoding(true, false); break;
+                    default: throw new IOException("Unsupported console input preamble.");
+                }
+                TextReader originalInput = Console.In;
+                try {
+                    // Keep the code page: UnicodeLE Console.InputEncoding setters
+                    // skip SetConsoleCP, so changing to UTF-8 would leak native CP.
+                    Console.InputEncoding = startupEncoding;
+                    return target.Start();
+                } finally {
+                    try { Console.InputEncoding = originalEncoding; }
+                    finally { Console.SetIn(originalInput); }
+                }
             }
         }
 

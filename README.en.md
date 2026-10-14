@@ -31,11 +31,11 @@ In a VM, components and the key must be available inside the Windows guest. Runn
 
 If you change folders, certificate or naming format after discovery, rebuild the list.
 
-Content formats are unrestricted: PDF, DOCX, XLSX, XML, ZIP, images and other files can be signed. Folder search excludes signature files, `.tmp`, application logs and a nested output folder. Use the file picker to select such files explicitly.
+Content formats are unrestricted: PDF, DOCX, XLSX, XML, ZIP, images and other files can be signed. Folder search skips signature files, `.tmp` files and application logs; the file picker can select these explicitly. A nested output folder is excluded from sources.
 
 ## Output
 
-By default, the full source filename is included in the signature name:
+New installations include the full source filename in the signature name by default:
 
 ```text
 Documents/
