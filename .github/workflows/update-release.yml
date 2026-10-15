@@ -116,15 +116,25 @@ jobs:
       - name: Build explicit runtime payload
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Build-Release.ps1 -OutputDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
-      - name: Create draft, upload and verify all three assets, then publish stable latest
+      - name: Publish new assets or verify the identical immutable release
+        id: publication
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
           GH_PROMPT_DISABLED: '1'
           GH_NO_UPDATE_NOTIFIER: '1'
-        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\Publish-Release.ps1 -AssetDirectory .\release-assets -SourceCommit "$env:GITHUB_SHA"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $publication = & .\tools\Publish-Release.ps1 -AssetDirectory .\release-assets -SourceCommit $env:GITHUB_SHA
+          if ($publication.Status -cnotin @('published','already-published') -or $publication.SourceCommit -cnotmatch '^[0-9a-f]{40}$' -or $publication.ManifestSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Publication did not return a verified release identity.' }
+          ('source_commit=' + $publication.SourceCommit) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('manifest_sha256=' + $publication.ManifestSha256) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host ($publication.Status + ': ' + $publication.Tag)
       - name: Verify anonymous download through the production updater
         shell: powershell
+        env:
+          EXPECTED_RELEASE_COMMIT: ${{ steps.publication.outputs.source_commit }}
+          EXPECTED_RELEASE_MANIFEST_SHA256: ${{ steps.publication.outputs.manifest_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $expectedVersion = (Get-Content .\ActSigner.Version.json -Raw | ConvertFrom-Json).Version
@@ -145,8 +155,9 @@ jobs:
             if ($result.Status -cne 'updated' -or $result.Version -cne $expectedVersion) { throw ('Public update download did not prepare the published version: ' + $result.Status) }
             $selection = Get-ActLaunchSelection -BundledRoot $bundledRoot -StateRoot $stateRoot
             if (-not $selection.UsingCached -or $selection.Version -cne $expectedVersion) { throw 'The published package is not selectable on the next launch.' }
-            $manifest = Get-Content (Join-Path $selection.ApplicationRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
-            if ($manifest.SourceCommit -cne $env:GITHUB_SHA) { throw 'The public update differs from the tested source commit.' }
+            $manifestPath = Join-Path $selection.ApplicationRoot 'payload-manifest.json'
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.SourceCommit -cne $env:EXPECTED_RELEASE_COMMIT -or (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:EXPECTED_RELEASE_MANIFEST_SHA256) { throw 'The public update differs from the verified published package.' }
             Write-Host ('PASS: anonymous GitHub download, verified full payload and next-launch selection for ' + $expectedVersion)
           } finally {
             if ([IO.Directory]::Exists($probeRoot)) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }

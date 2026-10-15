@@ -16,7 +16,7 @@ try {
     foreach ($path in $expected) {
         $file = Join-Path $source $path
         [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($file))
-        [IO.File]::WriteAllText($file, ('SYNTHETIC PAYLOAD ' + $path), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($file, ('# SYNTHETIC PAYLOAD ' + $path), (New-Object Text.UTF8Encoding($false)))
     }
     [IO.File]::WriteAllText((Join-Path $source 'ActSigner.Version.json'), '{"SchemaVersion":1,"Version":"1.5.0","LauncherProtocol":1}')
     $private = @('settings.json','documents/SYNTHETIC-PRIVATE.pdf','documents/SYNTHETIC-PRIVATE.pdf.sig','keys/SYNTHETIC-PRIVATE.key','diagnostics/results.json','ActSigner.Update.Tests.ps1','tools/private.ps1','.github/workflows/private.yml','docs/private.md','ActSigner.Secret.psm1')
@@ -95,13 +95,14 @@ try {
     try {
         $env:GITHUB_ACTIONS = 'true'; $env:GITHUB_EVENT_NAME = 'push'; $env:GITHUB_REF = 'refs/heads/main'
         $env:GITHUB_REPOSITORY = 'Alox1d/act-signer'; $env:GITHUB_SHA = $commit; $env:GH_TOKEN = 'SYNTHETIC-NON-CREDENTIAL'
-        $state = @{ Release = $null; Calls = (New-Object 'System.Collections.Generic.List[string]'); RejectUpload = $false; FailDownload = $false; WrongTag = $false }
+        $state = @{ Release = $null; Calls = (New-Object 'System.Collections.Generic.List[string]'); RejectUpload = $false; FailDownload = $false; WrongTag = $false; DownloadDirectory = $output }
         $fakeGh = {
             param([string[]]$Arguments)
             $line = $Arguments -join ' '; $state.Calls.Add($line)
             if ($Arguments[0] -ceq 'api') {
                 if ($Arguments[1] -like '*/git/ref/tags/*') {
                     if ($state.WrongTag) { return [pscustomobject]@{ ExitCode = 0; Output = '{"object":{"type":"commit","sha":"ffffffffffffffffffffffffffffffffffffffff"}}' } }
+                    if ($null -ne $state.Release -and -not $state.Release.draft) { return [pscustomobject]@{ ExitCode = 0; Output = ('{"object":{"type":"commit","sha":"' + $state.Release.target_commitish + '"}}') } }
                     return [pscustomobject]@{ ExitCode = 1; Output = 'gh: Not Found (HTTP 404)' }
                 }
                 if ($null -eq $state.Release) { return [pscustomobject]@{ ExitCode = 0; Output = '[[]]' } }
@@ -115,9 +116,9 @@ try {
             } elseif ($Arguments[1] -ceq 'download') {
                 if ($state.FailDownload) { return [pscustomobject]@{ ExitCode = 1; Output = 'SYNTHETIC readback failed' } }
                 $destination = $Arguments[[Array]::IndexOf($Arguments, '--dir') + 1]
-                [IO.File]::Copy($zipPath, (Join-Path $destination 'ActSigner-1.5.0.zip'))
-                [IO.File]::Copy($manifestPath, (Join-Path $destination 'ActSigner-update.json'))
-                [IO.File]::Copy($publicZipPath, (Join-Path $destination 'CSPSigner-1.5.0.zip'))
+                foreach ($name in @('ActSigner-1.5.0.zip','ActSigner-update.json','CSPSigner-1.5.0.zip')) {
+                    [IO.File]::Copy((Join-Path $state.DownloadDirectory $name), (Join-Path $destination $name))
+                }
             } elseif ($Arguments[1] -ceq 'edit') { $state.Release.draft = $false }
             return [pscustomobject]@{ ExitCode = 0; Output = '' }
         }.GetNewClosure()
@@ -130,9 +131,92 @@ try {
         Assert-Package (@($calls | Where-Object { $_ -like ('release upload *' + $publicZipPath + '*') }).Count -eq 1) 'Publication must actually upload the branded download, not only invent it in a mock response.'
         Assert-Package (@($calls | Where-Object { $_ -like 'release download *--pattern CSPSigner-1.5.0.zip*' }).Count -eq 1) 'Publication must request readback of the branded archive.'
         Assert-Package (@($calls | Where-Object { $_ -like 'release create *--title CSPSigner 1.5.0*' }).Count -eq 1) 'Release API must use the selected public product name.'
+        # A retry must inspect immutable assets, never replace them or create another release.
+        $state.Calls.Clear()
+        $repeated = & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh
+        Assert-Package ($repeated.Status -ceq 'already-published' -and $repeated.SourceCommit -ceq $commit -and $repeated.ManifestSha256 -ceq (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()) 'An identical published package must return its verified identity without mutation.'
+        Assert-Package (@($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'Published-package verification must use only read operations.'
+        # History cleanup changes the commit, and ZIP timestamps change the archive digest,
+        # while every shipped file remains byte-identical. Neither requires another version.
+        $historicalCommit = 'ffffffffffffffffffffffffffffffffffffffff'
+        $historicalOutput = Join-Path $testRoot 'historical-release'
+        $null = & $builder -SourceRoot $source -OutputDirectory $historicalOutput -SourceCommit $historicalCommit
+        $historicalZip = Join-Path $historicalOutput 'ActSigner-1.5.0.zip'
+        $archive = [IO.Compression.ZipFile]::Open($historicalZip, [IO.Compression.ZipArchiveMode]::Update)
+        try { $archive.Entries[0].LastWriteTime = [DateTimeOffset]'2001-01-01T00:00:00Z' } finally { $archive.Dispose() }
+        [IO.File]::Copy($historicalZip, (Join-Path $historicalOutput 'CSPSigner-1.5.0.zip'), $true)
+        $historicalManifestPath = Join-Path $historicalOutput 'ActSigner-update.json'
+        $historicalManifest = [IO.File]::ReadAllText($historicalManifestPath) | ConvertFrom-Json
+        $historicalManifest.Size = (Get-Item -LiteralPath $historicalZip).Length
+        $historicalManifest.Sha256 = (Get-FileHash -LiteralPath $historicalZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllText($historicalManifestPath, ($historicalManifest | ConvertTo-Json -Depth 6))
+        $state.DownloadDirectory = $historicalOutput
+        $state.Release.target_commitish = $historicalCommit
+        foreach ($asset in $state.Release.assets) { $asset.size = (Get-Item -LiteralPath (Join-Path $historicalOutput $asset.name)).Length }
+        $state.Calls.Clear()
+        $historical = & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh
+        Assert-Package ($historical.Status -ceq 'already-published' -and $historical.SourceCommit -ceq $historicalCommit -and $historical.ManifestSha256 -ceq (Get-FileHash -LiteralPath $historicalManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()) 'Identical payloads must preserve the verified historical manifest identity after a history rewrite.'
+        Assert-Package ($historicalManifest.Sha256 -cne $manifest.Sha256) 'The fixture must compare real archives with different ZIP bytes, not only a changed JSON commit.'
+        Assert-Package (@($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'History-rewrite recovery must never create, upload or edit releases.'
+        # A legitimate but different same-version package is still rejected, even when its
+        # own manifest, file digests and archive digests are all internally consistent.
+        $changedOutput = Join-Path $testRoot 'changed-release'
+        $readmePath = Join-Path $source 'README.txt'; $originalReadme = [IO.File]::ReadAllBytes($readmePath)
+        try {
+            [IO.File]::WriteAllText($readmePath, 'SYNTHETIC CHANGED RUNTIME')
+            $null = & $builder -SourceRoot $source -OutputDirectory $changedOutput -SourceCommit $historicalCommit
+        } finally { [IO.File]::WriteAllBytes($readmePath, $originalReadme) }
+        $state.DownloadDirectory = $changedOutput
+        foreach ($asset in $state.Release.assets) { $asset.size = (Get-Item -LiteralPath (Join-Path $changedOutput $asset.name)).Length }
         $state.Calls.Clear(); $rejected = $false
         try { & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null } catch { $rejected = $true }
-        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -like 'release *' }).Count -eq 0) 'Published versions must be refused before any mutation.'
+        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'Changed same-version payload bytes must be refused without modifying published assets.'
+        # Extra archive content cannot hide behind a valid declared archive digest.
+        $state.DownloadDirectory = $historicalOutput
+        $archive = [IO.Compression.ZipFile]::Open($historicalZip, [IO.Compression.ZipArchiveMode]::Update)
+        try { $entry = $archive.CreateEntry('unexpected.txt'); $writer = New-Object IO.StreamWriter($entry.Open()); try { $writer.Write('SYNTHETIC EXTRA') } finally { $writer.Dispose() } } finally { $archive.Dispose() }
+        [IO.File]::Copy($historicalZip, (Join-Path $historicalOutput 'CSPSigner-1.5.0.zip'), $true)
+        $historicalManifest.Size = (Get-Item -LiteralPath $historicalZip).Length
+        $historicalManifest.Sha256 = (Get-FileHash -LiteralPath $historicalZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllText($historicalManifestPath, ($historicalManifest | ConvertTo-Json -Depth 6))
+        foreach ($asset in $state.Release.assets) { $asset.size = (Get-Item -LiteralPath (Join-Path $historicalOutput $asset.name)).Length }
+        $state.Calls.Clear(); $rejected = $false
+        try { & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null } catch { $rejected = $true }
+        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'Extra ZIP entries must be rejected despite matching archive digest and size.'
+        # Archive-level checks alone cannot detect a lying per-file digest. Keep the
+        # original declared file hashes while changing same-length bytes inside a valid ZIP.
+        $tamperedOutput = Join-Path $testRoot 'tampered-release'
+        [void][IO.Directory]::CreateDirectory($tamperedOutput)
+        foreach ($name in @('ActSigner-1.5.0.zip','ActSigner-update.json','CSPSigner-1.5.0.zip')) { [IO.File]::Copy((Join-Path $output $name), (Join-Path $tamperedOutput $name)) }
+        $tamperedZip = Join-Path $tamperedOutput 'ActSigner-1.5.0.zip'
+        $archive = [IO.Compression.ZipFile]::Open($tamperedZip, [IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $entry = $archive.GetEntry('README.txt'); $length = $entry.Length
+            $writer = New-Object IO.StreamWriter($entry.Open())
+            try { $writer.Write(('X' * [int]$length)) } finally { $writer.Dispose() }
+        } finally { $archive.Dispose() }
+        [IO.File]::Copy($tamperedZip, (Join-Path $tamperedOutput 'CSPSigner-1.5.0.zip'), $true)
+        $tamperedManifestPath = Join-Path $tamperedOutput 'ActSigner-update.json'
+        $tamperedManifest = [IO.File]::ReadAllText($tamperedManifestPath) | ConvertFrom-Json
+        $tamperedManifest.Size = (Get-Item -LiteralPath $tamperedZip).Length
+        $tamperedManifest.Sha256 = (Get-FileHash -LiteralPath $tamperedZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllText($tamperedManifestPath, ($tamperedManifest | ConvertTo-Json -Depth 6))
+        $state.DownloadDirectory = $tamperedOutput
+        foreach ($asset in $state.Release.assets) { $asset.size = (Get-Item -LiteralPath (Join-Path $tamperedOutput $asset.name)).Length }
+        $state.Calls.Clear(); $rejected = $false
+        try { & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null } catch { $rejected = $_.Exception.Message -like '*Payload integrity check failed: README.txt*' }
+        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'Actual per-file SHA verification must reject changed ZIP bytes even with valid archive digests and matching declared file metadata.'
+        $state.DownloadDirectory = $output
+        foreach ($asset in $state.Release.assets) { $asset.size = (Get-Item -LiteralPath (Join-Path $output $asset.name)).Length }
+        $state.Release.target_commitish = $commit
+        $state.WrongTag = $true; $state.Calls.Clear(); $rejected = $false
+        try { & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null } catch { $rejected = $true }
+        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'An identical published package with a tag pointing outside its declared target must still be refused.'
+        $state.WrongTag = $false
+        $state.Release.prerelease = $true; $state.Calls.Clear(); $rejected = $false
+        try { & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null } catch { $rejected = $true }
+        Assert-Package ($rejected -and @($state.Calls | Where-Object { $_ -notlike 'api *' -and $_ -notlike 'release download *' }).Count -eq 0) 'A same-version prerelease must not satisfy stable publication.'
+        $state.Release.prerelease = $false
         $state.Release.draft = $true; $state.Release.assets = @(); $state.Calls.Clear()
         & $publisher -AssetDirectory $output -SourceCommit $commit -GhCommand $fakeGh | Out-Null
         Assert-Package (@($state.Calls | Where-Object { $_ -like 'release create *' }).Count -eq 0 -and @($state.Calls | Where-Object { $_ -like 'release upload *--clobber*' }).Count -eq 1) 'Same-commit incomplete draft must resume without another release.'
@@ -169,5 +253,5 @@ try {
     try { & $builder -SourceRoot $source -OutputDirectory (Join-Path $testRoot 'missing') -SourceCommit $commit | Out-Null } catch { $rejected = $true }
     Assert-Package $rejected 'Incomplete runtime payload must be rejected.'
     Write-Host 'Build-Release tests passed: default-SourceRoot subprocess from unrelated CWD, real allowlist ZIP, manifest/file hashes, private-file exclusion, immutable assets and version/missing-file rejection.'
-    Write-Host 'Publish-Release tests passed: draft/full-pair/readback/stable publication, published-version refusal, same-commit recovery, mismatched commit/tag refusal, interrupted upload/readback and main-only gating.'
+    Write-Host 'Publish-Release tests passed: draft/full-pair/readback/stable publication, verified immutable published-version retries, changed/extra payload rejection, same-commit draft recovery, mismatched commit/tag refusal, interrupted upload/readback and main-only gating.'
 } finally { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force } }
