@@ -6,12 +6,14 @@ on:
     paths:
       - 'ActSigner.UI.psm1'
       - 'ActSigner.UI.Tests.ps1'
+      - 'CSPSigner.Preview.UI.Tests.ps1'
       - '.github/workflows/ui-layout-check.yml'
   pull_request:
     branches: [main]
     paths:
       - 'ActSigner.UI.psm1'
       - 'ActSigner.UI.Tests.ps1'
+      - 'CSPSigner.Preview.UI.Tests.ps1'
       - '.github/workflows/ui-layout-check.yml'
 
 permissions:
@@ -29,6 +31,9 @@ jobs:
       - name: Measure actual WinForms layout
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.UI.Tests.ps1 -ArtifactDirectory .\ui-test-artifacts
+      - name: Verify automatic signed-file preview and selection
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\CSPSigner.Preview.UI.Tests.ps1
       - name: Upload synthetic measurements and form images
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

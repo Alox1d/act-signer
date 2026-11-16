@@ -14,6 +14,10 @@ The plan is sorted by relative path. Reparse points, including symbolic links an
 
 Calling `Get-ActPlan` without `-AllFiles` or `-SourceFiles` preserves the previous act-filename filter and PDF-header requirement for compatibility with scripts. The application always uses the general mode.
 
+Folder preselection defaults to `SelectOnlySignedFiles=true`. The additive `Get-ActSignaturePresence -Items <plan.Items> -Inspector <byte-pair callback>` safely reads exact source/signature snapshots and returns `matched`, `unconfirmed` or `none`, matching/candidate counts and diagnostics. It reuses the complete-signer mathematical predicate and a hash-pair cache bounded to 4096 inspections / 512 MiB of verification input. It never opens a signing session or checks certificate trust. Preview evidence is advisory: batch processing independently rechecks current bytes and signer identity. Explicit file picks and manual overrides remain available.
+
+Saved folders load automatically; source/output/certificate/naming edits refresh after 450 ms idle. Ordinary refresh retains checkboxes and explicit-file scope. Toggling the option resets folder defaults. Selected duplicate signature paths disable the action before batch preparation. Automatic refresh errors are inline; explicit refresh retains the error dialog.
+
 ## Output and companion files
 
 Saving beside sources adds a detached SIG in the source directory. Separate output preserves relative paths and copies the selected source byte for byte when a new signature is needed. Only neighboring sidecars whose complete signer set is mathematically verified against that source are copied. Unselected attachments are excluded.

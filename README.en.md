@@ -29,7 +29,11 @@ In a VM, components and the key must be available inside the Windows guest. Runn
 4. Review the list, select files and click **Проверить и подписать** (check and sign).
 5. Enter the PIN in the standard CryptoPro or token dialog and wait for the console summary.
 
-If you change folders, certificate or naming format after discovery, click **Обновить список** (refresh list). Refreshing the same list preserves checkboxes and an explicit file selection.
+The saved folder loads when the window opens. Folder, certificate and naming changes refresh the list automatically while retaining checkboxes and explicit-file scope. **Обновить список** (refresh list) repeats discovery after external file changes.
+
+**Автовыбор: только файлы с подписью** (preselect only files with a signature) is ON by default. Folder discovery preselects documents whose exact bytes have a mathematically confirmed signature. Other rows remain manually selectable. Turn the option OFF or explicitly pick files to sign new unsigned files. Expired foreign certificates do not prevent this mathematical check; unconfirmed results remain distinct. Changing the option reapplies folder defaults.
+
+Conflicting signature target names are shown before signing. Uncheck extra files or choose the full-filename naming format.
 
 Ctrl/Shift highlights a group of rows; Space toggles its checkboxes. Group actions are also available in the right-click menu. **Выбрать все** (select all) and **Снять все** (clear all) affect the whole list.
 

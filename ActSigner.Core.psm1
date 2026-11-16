@@ -141,6 +141,60 @@ function Test-ActCompleteMathematicalResult {
     return $false
 }
 
+function Get-ActSignaturePresence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory=$true)][scriptblock]$Inspector
+    )
+    # Preview evidence never replaces the batch's fresh byte/signer checks.
+    $context=@{Cache=@{};Calls=0;WorkBytes=[long]0;Exhausted=$false}
+    foreach($item in @($Items)){
+        if($null -eq $item){continue}
+        $sourceState=$null
+        $candidates=@()
+        $matching=0
+        $status='unconfirmed'
+        $message='Связь соседних подписей с этим файлом не подтверждена.'
+        try{
+            $candidates=@(Get-ActNeighborSignaturePaths $item)
+            if($candidates.Count -eq 0){$status='none';$message='Подписи рядом не найдены.'}
+            elseif($context.Exhausted){$message='Достигнут предел проверки связей. Разделите файлы на меньшие папки.'}
+            else{
+                $sourceState=Open-ActReadState -Path $item.SourcePath
+                foreach($path in $candidates){
+                    $signatureState=$null
+                    try{
+                        $signatureState=Open-ActReadState -Path $path
+                        $answer=Invoke-ActCachedInspection $sourceState $signatureState $Inspector $context
+                        if(Test-ActCompleteMathematicalResult $answer){$matching++}
+                        else{
+                            if($null -ne $answer.PSObject.Properties['Message'] -and -not [string]::IsNullOrWhiteSpace([string]$answer.Message)){$message=[string]$answer.Message}
+                            if($null -ne $answer.PSObject.Properties['Signers']){
+                                $codes=@(foreach($signer in @($answer.Signers)){
+                                    if($null -ne $signer -and $null -ne $signer.PSObject.Properties['HResult'] -and [string]$signer.HResult -match '^0x[0-9A-Fa-f]{8}$' -and $signer.HResult -cne '0x00000000'){$signer.HResult}
+                                })
+                                $codes=@($codes | Select-Object -Unique -First 16)
+                                if($codes.Count -gt 0){$message+=' Коды: '+($codes -join ', ')}
+                            }
+                        }
+                    }
+                    catch{$message='Связь не подтверждена: '+$_.Exception.Message}
+                    finally{if($null -ne $signatureState){$signatureState.Stream.Dispose()}}
+                    if($context.Exhausted){break}
+                }
+                if($matching -gt 0){
+                    $status='matched'
+                    $message='Математически подтверждена подпись точных байтов файла. Доверие и сроки сертификатов не проверялись.'
+                }
+            }
+        }
+        catch{$message='Связь не подтверждена: '+$_.Exception.Message}
+        finally{if($null -ne $sourceState){$sourceState.Stream.Dispose()}}
+        [pscustomobject]@{SourcePath=[string]$item.SourcePath;Status=$status;MatchingSignatureCount=$matching;CandidateCount=$candidates.Count;Message=$message}
+    }
+}
+
 function Find-ActSiblingSignatureBinding {
     param($Item, $SignatureState, [scriptblock]$Inspector, [hashtable]$Context)
     $directoryPath = [IO.Path]::GetDirectoryName($Item.SourcePath)
@@ -805,4 +859,4 @@ function Invoke-ActBatch {
     }
 }
 
-Export-ModuleMember -Function Get-ActPlan, Get-ActSha256, Read-ActPdfBytes, Write-NewActFile, Copy-ActFileNoOverwrite, Invoke-ActBatch
+Export-ModuleMember -Function Get-ActPlan, Get-ActSignaturePresence, Get-ActSha256, Read-ActPdfBytes, Write-NewActFile, Copy-ActFileNoOverwrite, Invoke-ActBatch

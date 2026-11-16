@@ -17,6 +17,9 @@ Windows Script Host, действующий сертификат ГОСТ-2012 �
 
 Ctrl/Shift выделяет строки; пробел меняет галочки группы.
 Выбрать все / Снять все меняют весь список. Обновить список сохраняет выбор.
+Список обновляется сам при запуске и изменении параметров.
+По умолчанию автовыбор отмечает файлы с подтверждённой подписью.
+Для новых файлов выключите эту опцию или выберите их явно.
 Архивы при поиске папки без галочек; выбранные явно файлы отмечены.
 
 Формат файлов произвольный, размер одного файла - до 64 МиБ.
@@ -40,6 +43,8 @@ ENGLISH QUICK START (APPLICATION UI IS IN RUSSIAN)
 4. Review the list and click Проверить и подписать (check and sign).
 5. Enter the PIN in the standard CryptoPro or token dialog.
 Ctrl/Shift highlights rows; Space toggles their checkboxes.
+The list refreshes automatically on startup and parameter changes.
+Signed-file preselection is ON by default; turn it OFF for unsigned files.
 Folder archives start unchecked; explicitly picked files start checked.
 
 Requires CryptoPro CSP, local CAdESCOM, Windows Script Host,

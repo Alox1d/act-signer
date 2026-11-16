@@ -15,7 +15,7 @@ $module = Import-Module $ModulePath -Force -PassThru
 # Do not import Settings, CryptoPro, or the application entry point.
 & $module {
     function script:Get-ActSignerSettings {
-        [pscustomobject]@{ SourceRoot = 'C:\SyntheticActs'; SeparateOutputRoot = 'C:\SyntheticOutput'; SaveBesideSources = $false }
+        [pscustomobject]@{ SourceRoot = 'C:\SyntheticActs'; SeparateOutputRoot = 'C:\SyntheticOutput'; SaveBesideSources = $false; SelectOnlySignedFiles = $false }
     }
     function script:Save-ActSignerSettings { param($SourceRoot, $SeparateOutputRoot, $SaveBesideSources, $SignatureNaming) return $true }
 }

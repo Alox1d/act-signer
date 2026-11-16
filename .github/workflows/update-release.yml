@@ -66,6 +66,12 @@ jobs:
       - name: Measure actual WinForms layout
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\ActSigner.UI.Tests.ps1 -ArtifactDirectory .\ui-test-artifacts
+      - name: Verify signed-file presence against exact bytes
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\CSPSigner.Preview.Tests.ps1
+      - name: Verify automatic signed-file preview and selection
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\CSPSigner.Preview.UI.Tests.ps1
       - name: Verify updater filesystem transactions and rejection cases
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\ActSigner.Update.Tests.ps1

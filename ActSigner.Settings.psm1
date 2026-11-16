@@ -19,6 +19,7 @@ function Get-ActSignerSettings {
         SeparateOutputRoot = ''
         SaveBesideSources = $true
         SignatureNaming = 'file_signer'
+        SelectOnlySignedFiles = $true
     }
     try {
         if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -41,7 +42,7 @@ function Get-ActSignerSettings {
             }
             # Use CreateNew semantics to avoid overwriting a profile created
             # by another process while we were reading the old preferences.
-            [void](Save-ActSignerSettings -Path $Path -SourceRoot $migrated.SourceRoot -SeparateOutputRoot $migrated.SeparateOutputRoot -SaveBesideSources $migrated.SaveBesideSources -SignatureNaming $migrated.SignatureNaming -OnlyIfMissing)
+            [void](Save-ActSignerSettings -Path $Path -SourceRoot $migrated.SourceRoot -SeparateOutputRoot $migrated.SeparateOutputRoot -SaveBesideSources $migrated.SaveBesideSources -SignatureNaming $migrated.SignatureNaming -SelectOnlySignedFiles $migrated.SelectOnlySignedFiles -OnlyIfMissing)
             if ([IO.File]::Exists($Path)) { return Get-ActSignerSettings -Path $Path }
             return $migrated
         }
@@ -66,6 +67,8 @@ function Get-ActSignerSettings {
         if ($null -ne $mode -and $mode.Value -is [bool]) {
             $settings.SaveBesideSources = $mode.Value
         }
+        $selection=$loaded.PSObject.Properties['SelectOnlySignedFiles']
+        if($null -ne $selection -and $selection.Value -is [bool]){$settings.SelectOnlySignedFiles=$selection.Value}
     }
     catch {
         # Missing, damaged or inaccessible preferences never block the app.
@@ -82,7 +85,8 @@ function Save-ActSignerSettings {
         [bool]$SaveBesideSources = $true,
         [string]$Path,
         [ValidateSet('file_signer','signer','document_signer','legacy')][string]$SignatureNaming = 'file_signer',
-        [switch]$OnlyIfMissing
+        [switch]$OnlyIfMissing,
+        [bool]$SelectOnlySignedFiles = $true
     )
 
     $temporaryPath = $null
@@ -98,6 +102,7 @@ function Save-ActSignerSettings {
             SeparateOutputRoot = ([string]$SeparateOutputRoot).Trim()
             SaveBesideSources = $SaveBesideSources
             SignatureNaming = $SignatureNaming
+            SelectOnlySignedFiles = $SelectOnlySignedFiles
         }
         $json = ConvertTo-Json -InputObject $settings -Depth 2
         $temporaryPath = [IO.Path]::Combine($directory, '.settings-' + [guid]::NewGuid().ToString('N') + '.tmp')

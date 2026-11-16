@@ -49,7 +49,8 @@ function Show-ActSignerWindow {
         [scriptblock]$CertificateProvider,
         [scriptblock]$PlanProvider,
         [scriptblock]$FilePickerProvider,
-        [scriptblock]$FolderPickerProvider
+        [scriptblock]$FolderPickerProvider,
+        [scriptblock]$SignatureInspector
     )
 
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
@@ -73,6 +74,9 @@ function Show-ActSignerWindow {
             if (@($SourceFiles).Count -gt 0) { $scope.SourceFiles = [string[]]$SourceFiles }
             Get-ActPlan -Root $SourceRoot -OutputRoot $DestinationRoot -SignatureNaming $SignatureNaming -SignerLabel $SignerLabel -AllFiles -Recurse:([bool]$Recurse) @scope
         }
+    }
+    if($null -eq $SignatureInspector){
+        $SignatureInspector={param([byte[]]$SourceBytes,[byte[]]$SignatureBytes) Get-ActExistingSignatureInfo -PdfBytes $SourceBytes -SignatureBytes $SignatureBytes}
     }
 
     if ($null -eq $FilePickerProvider) {
@@ -118,6 +122,8 @@ function Show-ActSignerWindow {
     $namingModes=@('file_signer','signer','document_signer','legacy')
     $initialNaming='file_signer'
     if($null -ne $settings.PSObject.Properties['SignatureNaming'] -and $settings.SignatureNaming -cin $namingModes) { $initialNaming=$settings.SignatureNaming }
+    $initialOnlySigned=$true
+    if($null -ne $settings.PSObject.Properties['SelectOnlySignedFiles'] -and $settings.SelectOnlySignedFiles -is [bool]){$initialOnlySigned=$settings.SelectOnlySignedFiles}
     if (-not [string]::IsNullOrWhiteSpace($settings.SeparateOutputRoot)) {
         $defaultOutput = $settings.SeparateOutputRoot
     }
@@ -141,10 +147,13 @@ function Show-ActSignerWindow {
         LastSavedSeparateOutput = $settings.SeparateOutputRoot
         LastSavedBeside = [bool]$settings.SaveBesideSources
         LastSavedNaming = $initialNaming
+        LastSavedOnlySigned = $initialOnlySigned
         SettingsWarningShown = $false
         Started = $false
     }
     $ui = @{}
+    $autoRefresh=New-Object Windows.Forms.Timer
+    $autoRefresh.Interval=450
     $baseFont = New-Object System.Drawing.Font('Segoe UI', 9)
     $titleFont = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
     $toolTip = New-Object System.Windows.Forms.ToolTip
@@ -247,8 +256,20 @@ function Show-ActSignerWindow {
     $beside.Anchor = 'Left'
     $beside.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 5)
     $beside.TabIndex = 2
-    [void]$folders.Controls.Add($beside, 1, 1)
-    $folders.SetColumnSpan($beside, 2)
+    $selectionOptions=New-Object Windows.Forms.FlowLayoutPanel
+    $selectionOptions.Dock='Fill';$selectionOptions.AutoSize=$true
+    $selectionOptions.Margin=New-Object Windows.Forms.Padding(0)
+    [void]$selectionOptions.Controls.Add($beside)
+    $onlySigned=New-Object Windows.Forms.CheckBox
+    $ui.OnlySigned=$onlySigned
+    $onlySigned.Text='Автовыбор: только файлы с подписью'
+    $onlySigned.AccessibleName='Автовыбор только подписанных файлов'
+    $onlySigned.AutoSize=$true;$onlySigned.Checked=$initialOnlySigned
+    $onlySigned.Margin=New-Object Windows.Forms.Padding(16,1,0,5)
+    $toolTip.SetToolTip($onlySigned,'При поиске папки отмечаются только файлы с математически подтверждённой подписью их точных байтов. Все строки доступны для ручного выбора. Явно выбранные файлы отмечаются независимо от этой опции.')
+    [void]$selectionOptions.Controls.Add($onlySigned)
+    [void]$folders.Controls.Add($selectionOptions,1,1)
+    $folders.SetColumnSpan($selectionOptions,2)
     $outputLabel = New-Object System.Windows.Forms.Label
     $ui.OutputLabel = $outputLabel
     $outputLabel.Text = 'Папка результата:'
@@ -519,12 +540,13 @@ function Show-ActSignerWindow {
         $separateOutput = $state.SeparateOutputText.Trim()
         $saveBeside = [bool]$ui.Beside.Checked
         $signatureNaming=$namingModes[$ui.Naming.SelectedIndex]
+        $selectOnlySigned=[bool]$ui.OnlySigned.Checked
         if ([string]::Equals($source, $state.LastSavedSource, [StringComparison]::Ordinal) -and
             [string]::Equals($separateOutput, $state.LastSavedSeparateOutput, [StringComparison]::Ordinal) -and
-            $saveBeside -eq $state.LastSavedBeside -and $signatureNaming -ceq $state.LastSavedNaming) { return }
+            $saveBeside -eq $state.LastSavedBeside -and $signatureNaming -ceq $state.LastSavedNaming -and $selectOnlySigned -eq $state.LastSavedOnlySigned) { return }
         $saved = $false
         try {
-            $saved = Save-ActSignerSettings -SourceRoot $source -SeparateOutputRoot $separateOutput -SaveBesideSources $saveBeside -SignatureNaming $signatureNaming
+            $saved = Save-ActSignerSettings -SourceRoot $source -SeparateOutputRoot $separateOutput -SaveBesideSources $saveBeside -SignatureNaming $signatureNaming -SelectOnlySignedFiles $selectOnlySigned
         }
         catch { }
         if ($saved) {
@@ -532,6 +554,7 @@ function Show-ActSignerWindow {
             $state.LastSavedSeparateOutput = $separateOutput
             $state.LastSavedBeside = $saveBeside
             $state.LastSavedNaming = $signatureNaming
+            $state.LastSavedOnlySigned = $selectOnlySigned
         }
         elseif (-not $state.SettingsWarningShown) {
             $state.SettingsWarningShown = $true
@@ -544,18 +567,38 @@ function Show-ActSignerWindow {
         $selectedCount = 0
         $existingCount = 0
         $newCount = 0
+        $targets=@{}
         foreach ($row in $ui.Grid.Rows) {
             if ($null -eq $row.Tag) { continue }
             if ([bool]$row.Tag.ExistingSignature) { $existingCount++ }
             else {
                 $newCount++
             }
-            if ([bool]$row.Cells[0].Value) { $selectedCount++ }
+            if ([bool]$row.Cells[0].Value) {
+                $selectedCount++
+                $target=[string]$row.Tag.SignaturePath
+                if(-not $targets.ContainsKey($target)){$targets[$target]=0}
+                $targets[$target]++
+            }
+        }
+        $conflictCount=0
+        foreach($row in $ui.Grid.Rows){
+            if($null -eq $row.Tag){continue}
+            $cell=$row.Cells[2]
+            if($null -ne $cell.Tag){$cell.Value=$cell.Tag.Text;$cell.ToolTipText=$cell.Tag.ToolTip}
+            $cell.Style.ForeColor=[Drawing.Color]::Empty
+            $target=[string]$row.Tag.SignaturePath
+            if([bool]$row.Cells[0].Value -and $targets[$target] -gt 1){
+                $conflictCount++
+                $cell.Value='Одинаковое имя подписи'
+                $cell.Style.ForeColor=[Drawing.Color]::Firebrick
+                $cell.ToolTipText='Несколько выбранных файлов: '+$target+'. Выберите формат с полным именем файла или снимите лишние галочки.'
+            }
         }
         $certificateIndex = $ui.Certificate.SelectedIndex
         $hasCertificate = $certificateIndex -ge 0 -and $certificateIndex -lt $state.Certificates.Count
         $ui.Sign.Text = 'Проверить и подписать ({0})' -f $selectedCount
-        $ui.Sign.Enabled = (-not $state.Busy) -and $null -ne $state.Plan -and $selectedCount -gt 0 -and $hasCertificate
+        $ui.Sign.Enabled = (-not $state.Busy) -and $null -ne $state.Plan -and $selectedCount -gt 0 -and $hasCertificate -and $conflictCount -eq 0
         $ui.Find.Enabled = (-not $state.Busy) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Source.Text)) -and
             (-not [string]::IsNullOrWhiteSpace($ui.Output.Text))
@@ -568,6 +611,7 @@ function Show-ActSignerWindow {
         $ui.Source.Enabled = -not $state.Busy
         $ui.SourceBrowse.Enabled = -not $state.Busy
         $ui.Beside.Enabled = -not $state.Busy
+        $ui.OnlySigned.Enabled = -not $state.Busy
         $ui.Output.Enabled = (-not $state.Busy) -and (-not $ui.Beside.Checked)
         $ui.OutputBrowse.Enabled = $ui.Output.Enabled
         $ui.Grid.Enabled = -not $state.Busy
@@ -577,13 +621,18 @@ function Show-ActSignerWindow {
             $skippedCount = @($state.Plan.SkippedReparsePoints).Count
             if ($skippedCount -gt 0) { $text += '   |   Пропущено ссылок: ' + $skippedCount }
             if ($ui.Grid.Rows.Count -eq 0) { $text = 'Подходящие файлы в этой папке и её подпапках не найдены.' }
+            if($conflictCount -gt 0){$text+='   |   Конфликт имён: '+$conflictCount+'. Выберите формат с полным именем файла или снимите лишние галочки.'}
             $ui.Summary.Text = $text
             $toolTip.SetToolTip($ui.Summary, $text)
         }
     }.GetNewClosure()
 
+    $queueAutoRefresh={
+        $autoRefresh.Stop()
+        if($state.Started){$autoRefresh.Start()}
+    }.GetNewClosure()
     $invalidatePlan = {
-        param([bool]$ResetSelection=$false)
+        param([bool]$ResetSelection=$false,[bool]$QueueRefresh=$true)
         if ($state.SuppressChanges) { return }
         if($ResetSelection){$state.PreviewChecks=@{}}
         elseif($ui.Grid.Rows.Count -gt 0){
@@ -595,9 +644,10 @@ function Show-ActSignerWindow {
         $state.SuppressGridEvents = $true
         try { $ui.Grid.Rows.Clear() }
         finally { $state.SuppressGridEvents = $false }
-        $ui.Summary.Text = 'Параметры изменены. Обновите список или выберите файлы.'
+        $ui.Summary.Text = 'Параметры изменены. Обновляем список...'
         $toolTip.SetToolTip($ui.Summary, $ui.Summary.Text)
         & $syncAction
+        if($QueueRefresh){& $queueAutoRefresh}
     }.GetNewClosure()
 
     $syncOutputToSource = {
@@ -787,8 +837,9 @@ function Show-ActSignerWindow {
     }.GetNewClosure()
 
     $findActs = {
-        param([bool]$ScanFolder = $true,[bool]$PreserveSelection = $false)
+        param([bool]$ScanFolder = $true,[bool]$PreserveSelection = $false,[bool]$Automatic=$false)
         if ($state.Busy) { return }
+        $autoRefresh.Stop()
         $previousChecks=@{}
         if($PreserveSelection){
             $previousChecks=$state.PreviewChecks.Clone()
@@ -811,7 +862,7 @@ function Show-ActSignerWindow {
             return
         }
         & $savePreferences
-        & $invalidatePlan (-not $PreserveSelection)
+        & $invalidatePlan (-not $PreserveSelection) $false
         $state.Busy = $true
         $ui.Form.UseWaitCursor = $true
         $ui.Find.Text = 'Поиск...'
@@ -830,6 +881,10 @@ function Show-ActSignerWindow {
             }
             $plan = & $PlanProvider $sourceRoot $destinationRoot $signatureNaming $signerLabel $state.SourceFiles $state.Recurse
             if ($null -eq $plan) { throw 'Не удалось построить список файлов.' }
+            $presence=@{}
+            if($ScanFolder -and $ui.OnlySigned.Checked){
+                foreach($answer in @(Get-ActSignaturePresence -Items @($plan.Items) -Inspector $SignatureInspector)){$presence[[string]$answer.SourcePath]=$answer}
+            }
             $state.SuppressGridEvents = $true
             $ui.Grid.SuspendLayout()
             try {
@@ -841,8 +896,15 @@ function Show-ActSignerWindow {
                     if ($null -ne $item.PSObject.Properties['NeighborSignatureCount']) { $neighborCount = [int]$item.NeighborSignatureCount }
                     if ($neighborCount -gt 0) { $status = 'Проверить подписи (' + $neighborCount + ')'  }
                     if ($existing) { $status = 'Проверить подпись' }
+                    $confirmed=$false
+                    $signatureEvidence=$null
+                    if($presence.ContainsKey([string]$item.SourcePath)){
+                        $signatureEvidence=$presence[[string]$item.SourcePath]
+                        $confirmed=$signatureEvidence.Status -ceq 'matched'
+                        $status=if($confirmed){'Есть подпись этого файла ('+$signatureEvidence.MatchingSignatureCount+')'}elseif($signatureEvidence.Status -ceq 'none'){'Подписей рядом нет'}else{'Связь с подписью не подтверждена'}
+                    }
                     $archive=[IO.Path]::GetExtension([string]$item.SourcePath).ToLowerInvariant() -in @('.zip','.7z','.rar','.tar','.gz','.bz2','.xz','.tgz','.tbz','.tbz2','.txz','.zst','.cab','.iso')
-                    $checked=(-not $ScanFolder) -or ((-not $existing) -and (-not $archive))
+                    $checked=(-not $ScanFolder) -or ((-not $existing) -and (-not $archive) -and ((-not $ui.OnlySigned.Checked) -or $confirmed))
                     if($previousChecks.ContainsKey([string]$item.SourcePath)){$checked=[bool]$previousChecks[[string]$item.SourcePath]}
                     $rowIndex = $ui.Grid.Rows.Add([object[]]@($checked, [string]$item.RelativePath, $status))
                     $row = $ui.Grid.Rows[$rowIndex]
@@ -858,6 +920,8 @@ function Show-ActSignerWindow {
                         $row.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::GrayText
                         $row.Cells[0].ToolTipText = 'Можно отметить для проверки существующей подписи. Подтверждённая подпись выбранного сертификата пропускается без ключа; неопределённая блокирует этот файл. Файл подписи не перезаписывается.'
                     }
+                    if($null -ne $signatureEvidence){$row.Cells[2].ToolTipText=$signatureEvidence.Message}
+                    $row.Cells[2].Tag=[pscustomobject]@{Text=$status;ToolTip=$row.Cells[2].ToolTipText}
                 }
             }
             finally {
@@ -875,7 +939,8 @@ function Show-ActSignerWindow {
             try { $ui.Grid.Rows.Clear() }
             finally { $state.SuppressGridEvents = $false }
             $ui.Summary.Text = 'Поиск не завершён. Проверьте пути и доступ к исходной папке.'
-            & $showError $_.Exception.Message 'Не удалось найти файлы'
+            if($Automatic){$ui.Summary.Text='Не удалось обновить список: '+$_.Exception.Message;$toolTip.SetToolTip($ui.Summary,$ui.Summary.Text)}
+            else{& $showError $_.Exception.Message 'Не удалось найти файлы'}
         }
         finally {
             $state.Busy = $false
@@ -884,6 +949,18 @@ function Show-ActSignerWindow {
             & $syncAction
         }
     }.GetNewClosure()
+
+    $autoRefresh.Add_Tick({
+        $autoRefresh.Stop()
+        if(-not $state.Started){return}
+        if($state.Busy){$autoRefresh.Start();return}
+        if(-not [IO.Directory]::Exists($ui.Source.Text.Trim())){
+            $ui.Summary.Text='Укажите существующую папку с файлами.';return
+        }
+        if([string]::IsNullOrWhiteSpace($ui.Output.Text)){return}
+        if($namingModes[$ui.Naming.SelectedIndex] -ne 'legacy' -and $ui.Certificate.SelectedIndex -lt 0){return}
+        & $findActs (@($state.SourceFiles).Count -eq 0) $true $true
+    }.GetNewClosure())
 
     $sourceBox.Add_TextChanged({
         if ($state.SuppressChanges) { return }
@@ -904,6 +981,7 @@ function Show-ActSignerWindow {
         & $savePreferences
     }.GetNewClosure())
     $naming.Add_SelectedIndexChanged({ & $invalidatePlan; & $savePreferences }.GetNewClosure())
+    $onlySigned.Add_CheckedChanged({& $invalidatePlan (@($state.SourceFiles).Count -eq 0);& $savePreferences}.GetNewClosure())
     $sourceBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $outputBox.Add_Leave({ & $savePreferences }.GetNewClosure())
     $sourceBrowse.Add_Click({if(& $browseFolder $false){& $findActs $true}}.GetNewClosure())
@@ -1031,9 +1109,10 @@ function Show-ActSignerWindow {
             $state.Started = $true
             & $refreshCertificates
             [void]$ui.Source.Focus()
+            & $queueAutoRefresh
         }
     }.GetNewClosure())
-    $form.Add_FormClosing({ & $savePreferences }.GetNewClosure())
+    $form.Add_FormClosing({$autoRefresh.Stop();$state.Started=$false;& $savePreferences}.GetNewClosure())
 
     & $syncOutputToSource
     & $syncAction
@@ -1047,6 +1126,7 @@ function Show-ActSignerWindow {
         return $state.Result
     }
     finally {
+        $autoRefresh.Stop();$autoRefresh.Dispose()
         $form.Dispose()
         $groupMenu.Dispose()
         $toolTip.Dispose()

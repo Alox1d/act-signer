@@ -17,6 +17,7 @@ try {
     Assert-Settings ($initial.SaveBesideSources -eq $true) 'First launch must save beside each act.'
 
     Assert-Settings ($initial.SignatureNaming -ceq 'file_signer') 'New profiles must default to full-filename signer filenames.'
+    Assert-Settings $initial.SelectOnlySignedFiles 'Automatic selection must default to files with a confirmed signature.'
 
     $source = '\\VBOXSVR\Акты & архив\2026'
     $output = 'D:\Подписи пользователя\Отдельная папка'
@@ -33,10 +34,16 @@ try {
     Assert-Settings ($loaded.SeparateOutputRoot -ceq $output) 'Beside mode erased the separate output preference.'
     Assert-Settings ($loaded.SaveBesideSources -eq $true) 'Explicit beside mode was lost.'
     $raw = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path))
-    Assert-Settings ((@($raw.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'SaveBesideSources,SeparateOutputRoot,SignatureNaming,SourceRoot') 'Settings contain unexpected data.'
+    Assert-Settings ((@($raw.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'SaveBesideSources,SelectOnlySignedFiles,SeparateOutputRoot,SignatureNaming,SourceRoot') 'Settings contain unexpected data.'
     $bytes = [IO.File]::ReadAllBytes($path)
     Assert-Settings ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) 'Settings encoding is not UTF-8 with BOM.'
     Assert-Settings (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($path)) -Filter '*.tmp' -Force).Count -eq 0) 'A staging file remained after saving.'
+    Assert-Settings (Save-ActSignerSettings -Path $path -SourceRoot $source -SelectOnlySignedFiles $false) 'Automatic-selection preference save failed.'
+    $loaded=Get-ActSignerSettings -Path $path
+    Assert-Settings (-not $loaded.SelectOnlySignedFiles) 'An explicit OFF preference must survive reloading.'
+    [IO.File]::WriteAllText($path, '{"SelectOnlySignedFiles":"false"}')
+    $loaded=Get-ActSignerSettings -Path $path
+    Assert-Settings $loaded.SelectOnlySignedFiles 'A string must not be coerced into an automatic-selection preference.'
 
     [IO.File]::WriteAllText($path, '{broken json')
     $loaded = Get-ActSignerSettings -Path $path
